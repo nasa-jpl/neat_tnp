@@ -1,0 +1,14 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Nix files
+*.nix
+
+# Build and distribution directories
+target/
+dist/
+build/
+*.egg-info/
+.eggs/

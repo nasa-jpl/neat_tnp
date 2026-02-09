@@ -1,0 +1,54 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "neat-tnp"
+version = "0.1.1"
+description = "Track Network Planning using NEAT-based Evolution of Graphs"
+# readme = "README.md"
+requires-python = ">=3.8"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [
+    {name = "Leon Thomm", email = "thomm@jpl.nasa.gov"},
+    {name = "Ethan Schaler", email = "ethan.schaler@jpl.nasa.gov"}
+]
+keywords = ["optimization", "genetic-algorithm", "NEAT", "graph-evolution", "network-planning"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+]
+
+dependencies = [
+    "numpy>=1.20",
+    "matplotlib>=3.5",
+    "networkx>=2.6",
+    "scikit-image>=0.19",  # TODO: replace skimage.draw.line_nd to avoid dependency here
+    # "gdal==3.9.3",
+    "gdal>=3.9.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "jupyterlab",
+    "ipykernel",
+    "ipympl",
+    "pytest",
+    "networkx",
+    "scikit-image",
+]
+
+# [project.urls]
+# Homepage = "https://github.com/yourorg/neat-tnp"
+# Repository = "https://github.com/yourorg/neat-tnp"
+
+[tool.maturin]
+module-name = "neat_tnp.neat_rs_tnp_rs"
+manifest-path = "crates/neat_rs_tnp_rs/Cargo.toml"
+# Include Python source files
+python-source = "."
+# Tell maturin to build a mixed Python/Rust package
+# include = ["./*.py", "crates/**/*"]
