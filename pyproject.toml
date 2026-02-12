@@ -12,7 +12,7 @@ license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [
     {name = "Leon Thomm", email = "thomm@jpl.nasa.gov"},
-    {name = "Ethan Schaler", email = "ethan.schaler@jpl.nasa.gov"}
+    {name = "Ethan Schaler", email = "ethan.w.schaler@jpl.nasa.gov"}
 ]
 keywords = ["optimization", "genetic-algorithm", "NEAT", "graph-evolution", "network-planning"]
 classifiers = [
@@ -41,9 +41,9 @@ dev = [
     "scikit-image",
 ]
 
-# [project.urls]
-# Homepage = "https://github.com/yourorg/neat-tnp"
-# Repository = "https://github.com/yourorg/neat-tnp"
+[project.urls]
+Homepage = "https://github.com/nasa-jpl/neat_tnp/"
+Repository = "https://github.com/nasa-jpl/neat_tnp/"
 
 [tool.maturin]
 module-name = "neat_tnp.neat_rs_tnp_rs"
