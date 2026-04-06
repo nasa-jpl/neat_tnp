@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -e
 
+# NOTE: This script is for local development/debugging only.
+# Production wheels are built automatically via GitHub Actions.
+# See .github/workflows/wheels.yml for CI/CD pipeline.
+
 # Array of Python versions to build for
 PYTHON_VERSIONS=("3.8" "3.9" "3.10" "3.11" "3.12")
 
