@@ -7,7 +7,7 @@ name = "neat-tnp"
 version = "0.1.1"
 description = "Track Network Planning using NEAT-based Evolution of Graphs"
 # readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [
@@ -54,24 +54,26 @@ python-source = "."
 # include = ["./*.py", "crates/**/*"]
 
 [tool.cibuildwheel]
-# Build for Python 3.8-3.12
-build = "cp38-* cp39-* cp310-* cp311-* cp312-*"
+# Build for Python 3.9-3.12
+build = "cp39-* cp310-* cp311-* cp312-*"
 
 # Skip 32-bit, musllinux, and PyPy
 skip = "*-win32 *-manylinux_i686 *-musllinux_* pp*"
 
-# Basic import test (GDAL tests would fail without system GDAL)
-test-command = "python -c \"import neat_tnp; import neat_tnp.neat_rs_tnp_rs; print('Import successful')\""
-test-requires = ["numpy>=1.20"]
+# Wheel testing requires system GDAL with exact version matching; handled in the test_wheels job.
+test-skip = "*"
 
 # Platform-specific settings
 [tool.cibuildwheel.linux]
 archs = ["x86_64", "aarch64"]
 manylinux-x86_64-image = "manylinux2014"
 manylinux-aarch64-image = "manylinux2014"
+before-all = "curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable --profile minimal"
+environment = { PATH = "$HOME/.cargo/bin:$PATH" }
 
 [tool.cibuildwheel.macos]
 archs = ["x86_64", "arm64"]
+environment = { MACOSX_DEPLOYMENT_TARGET = "10.12" }
 
 [tool.cibuildwheel.windows]
 archs = ["AMD64"]
