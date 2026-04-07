@@ -69,6 +69,8 @@ test-requires = ["numpy>=1.20"]
 archs = ["x86_64", "aarch64"]
 manylinux-x86_64-image = "manylinux2014"
 manylinux-aarch64-image = "manylinux2014"
+before-all = "curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable --profile minimal"
+environment = { PATH = "$HOME/.cargo/bin:$PATH" }
 
 [tool.cibuildwheel.macos]
 archs = ["x86_64", "arm64"]
