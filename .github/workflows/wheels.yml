@@ -115,7 +115,7 @@ jobs:
           # Pin the GDAL Python wrapper to match the installed system GDAL version,
           # then install our wheel without re-resolving gdal from PyPI.
           python -m pip install "GDAL==$(gdal-config --version)"
-          python -m pip install --no-deps wheelhouse/neat_tnp-*-cp$(echo ${{ matrix.python-version }} | tr -d '.')-*.whl
+          python -m pip install --no-deps --find-links wheelhouse --no-index neat-tnp
           python -m pip install numpy matplotlib networkx scikit-image
 
       - name: Test import
