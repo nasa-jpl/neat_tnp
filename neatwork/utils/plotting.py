@@ -1,18 +1,30 @@
+from __future__ import annotations
+
 import matplotlib.artist
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 from matplotlib.widgets import Slider
-from matplotlib.animation import FuncAnimation, FFMpegWriter, PillowWriter
 from matplotlib.collections import PatchCollection
 import matplotlib.patches as patches
-from matplotlib.lines import Line2D
 import matplotlib.patches as mpatches
+from matplotlib.ticker import MaxNLocator
 import numpy as np
 from numpy.typing import NDArray
-from typing import List, Set, Tuple, Optional, Dict, Any
+from typing import List, Tuple, Optional, Dict, Any, Union
 from dataclasses import dataclass, field
 import json
+import os
+import seaborn as sns
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo
+
+# NOTE: `SweepConfigResult` / `TrialResult` live in `testing/data_model.py`, which is
+# not shipped with the package. They are only referenced in type annotations of the
+# paper-figure helpers below; `from __future__ import annotations` keeps those
+# annotations lazy so this module imports cleanly without the testing harness.
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from data_model import SweepConfigResult, TrialResult
 
 style = 'seaborn-v0_8-whitegrid'
 plt.style.use(style)
@@ -25,9 +37,11 @@ def _read_png_metadata(path: str) -> dict:
             return {}
         return json.loads(img.info["custom_json"])
 
-def _write_png_metadata(path: str, data: str):
+def _write_png_metadata(path: str, data: Union[str, dict, list]):
     img = Image.open(path)
     metadata = PngInfo()
+    if isinstance(data, (dict, list)):
+        data = json.dumps(data)
     metadata.add_text("custom_json", data)
     img.save(path, pnginfo=metadata)
 
@@ -41,7 +55,11 @@ def _save_figure_with_metadata(
     Saves the figure to the specified path. 
     If format is PNG and metadata is provided, embeds it.
     """
-    fig.savefig(path, dpi=dpi)
+    root, ext = os.path.splitext(path)
+    if ext == "":
+        path = f"{root}.pdf"
+
+    fig.savefig(path, dpi=dpi, bbox_inches='tight')
     
     if metadata is not None and path.lower().endswith('.png'):
         _write_png_metadata(path, metadata)
@@ -62,6 +80,32 @@ class PlotGraph:
     dynamic_node_ids: Optional[List[int]] = None  # IDs corresponding to dynamic_nodes
     edge_ids: Optional[List[int]] = None  # IDs corresponding to edges
 
+def network_to_plot_graph(network, cost_map) -> PlotGraph:
+    """Convert a Network to a PlotGraph for visualization."""
+    from neatwork.types import NodeType
+    from neatwork.neatwork_py_eval import matrix_trajectories_mask
+    pos_by_id = {n.id: (int(n.pos[0]), int(n.pos[1])) for n in network.nodes}
+    fixed = [(n.id, pos_by_id[n.id]) for n in network.nodes if n.type == NodeType.Fixed]
+    dynamic = [(n.id, pos_by_id[n.id]) for n in network.nodes if n.type == NodeType.Flexible]
+    edges = []
+    edge_ids = []
+    for e in network.edges:
+        if e.enabled and e.node1 in pos_by_id and e.node2 in pos_by_id:
+            edges.append((pos_by_id[e.node1], pos_by_id[e.node2]))
+            edge_ids.append(e.id)
+    return PlotGraph(
+        cost_map=cost_map,
+        fixed_nodes=[p for _, p in fixed],
+        dynamic_nodes=[p for _, p in dynamic],
+        edges=edges,
+        highlight=matrix_trajectories_mask(cost_map, edges),
+        fitness=network.fitness,
+        fixed_node_ids=[i for i, _ in fixed],
+        dynamic_node_ids=[i for i, _ in dynamic],
+        edge_ids=edge_ids,
+    )
+
+
 def plot_graph_on_ax(
     ax: plt.Axes, 
     graph: PlotGraph, 
@@ -70,7 +114,8 @@ def plot_graph_on_ax(
     show_ids: bool = False,
     show_blobs: bool = True,
     show_legend: bool = True,
-    show_grid: bool = False
+    show_grid: bool = False,
+    show_coordinates: bool = True
 ) -> List[matplotlib.artist.Artist]:
     """
     Core utility function to draw a single PlotGraph onto a provided matplotlib axis.
@@ -104,7 +149,7 @@ def plot_graph_on_ax(
 
     # 3. Display the cost map
     im = ax.imshow(cost_map, cmap='binary', origin='upper', interpolation='nearest', 
-                   vmin=0, vmax=max(1, np.max(cost_map)), zorder=1)
+                   vmin=0, vmax=float(np.max(cost_map)), zorder=1)
     all_artists.append(im)
 
     # 4. Plot nodes (Data is already prepared)
@@ -129,61 +174,45 @@ def plot_graph_on_ax(
 
     # --- Plot highlighted cells ---
     if highlight_map is not None:
-        plot_rows, plot_cols = np.where(highlight_map > 0)
+        # Create an RGBA image instead of patches
+        # 0.0, 0.3, 0.9 is the highlight color
+        highlight_color = np.array([0.0, 0.3, 0.9, 1.0])
+        img_highlight = np.zeros((*highlight_map.shape, 4))
         
-        if len(plot_rows) > 0:
-            # 1. Get alpha values (normalized)
-            hl_values_nonzero = highlight_map[plot_rows, plot_cols].astype(float)
+        # Normalized highlighting 
+        mask = highlight_map > 0
+        if np.any(mask):
+            hl_values = highlight_map[mask].astype(float)
+            v_min, v_max = hl_values.min(), hl_values.max()
             
-            hl_range = (0.3, 0.6) # Min alpha of 0.1
-            hl_min, hl_max = hl_values_nonzero.min(), hl_values_nonzero.max()
-            hl_denom = hl_max - hl_min
-            
-            if hl_denom > 0:
-                hl_values_nonzero -= hl_min
-                hl_values_nonzero *= (hl_range[1]-hl_range[0]) / hl_denom
-                hl_values_nonzero += hl_range[0]
+            # Map values to alpha range [0.3, 0.6]
+            if v_max > v_min:
+                alphas = 0.3 + 0.3 * (hl_values - v_min) / (v_max - v_min)
             else:
-                hl_values_nonzero.fill(np.mean(hl_range))
+                alphas = np.full_like(hl_values, 0.45)
+                
+            img_highlight[mask, :3] = highlight_color[:3]
+            img_highlight[mask, 3] = alphas
             
-            # 2. Create an (N, 4) RGBA color array
-            highlight_col = [0.0, 0.3, 0.9]
-            colors = np.zeros((len(plot_rows), 4))
-            colors[:, 0:3] = highlight_col  # Set R, G, B
-            colors[:, 3] = hl_values_nonzero # Set Alpha
-            
-            # 3. Create a list of Rectangle patches
-            # A 1x1 cell is centered at (col, row). It spans (col-0.5) to (col+0.5).
-            # We want a smaller patch, e.g., 80% (0.8x0.8).
-            # So we start at (col - 0.4) and (row - 0.4).
-            patch_size = 0.8
-            offset = patch_size / 2.0
-            patch_list = []
-            for r, c in zip(plot_rows, plot_cols):
-                # Bottom-left corner is (c - offset, r - offset)
-                rect = patches.Rectangle((c - offset, r - offset), patch_size, patch_size)
-                patch_list.append(rect)
+            im_hl = ax.imshow(img_highlight, origin='upper', interpolation='nearest', zorder=2)
+            all_artists.append(im_hl)
 
-            # 4. Create the collection
-            collection = PatchCollection(
-                patch_list,
-                facecolors=colors,
-                zorder=2
-            )
-            
-            # 5. Add the collection to the axis
-            ax.add_collection(collection)
-            all_artists.append(collection)
-
-            # 6. Add the dummy artist for the legend
-            sc_dummy = ax.scatter([], [], c=highlight_col, marker='s', s=100, 
+            # Add dummy artist for legend
+            sc_dummy = ax.scatter([], [], c=[highlight_color[:3]], marker='s', s=100, 
                                    alpha=0.6, label='Activated Cells', zorder=-1)
             all_artists.append(sc_dummy)
 
     # 6. Plot formatting (if requested)
     if setup_axis:
-        ax.set_xlabel('Column Index (x)')
-        ax.set_ylabel('Row Index (y)')
+        if show_coordinates:
+            ax.set_xlabel('Column Index (x)')
+            ax.set_ylabel('Row Index (y)')
+            ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+            ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+        else:
+            ax.set_xticks([])
+            ax.set_yticks([])
+            
         if show_legend:
             ax.legend(loc='upper left', bbox_to_anchor=(1, 1))
         
@@ -234,19 +263,21 @@ def plot_graph_on_ax(
 
 
 def plot_graph(
-    graph: PlotGraph, 
-    title: str = "Graph Visualization", 
-    show_ids: bool = False, 
+    graph: PlotGraph,
+    title: str = "Graph Visualization",
+    show_ids: bool = False,
     show_blobs: bool = True,
     save_path: Optional[str] = None,
     dpi: int = 300,
     metadata: Optional[Any] = None,
-    show_grid: bool = False
+    show_grid: bool = False,
+    show_coordinates: bool = True,
+    show_legend: bool = False,
 ):
     """
     Visualizes a single PlotGraph on top of its cost map.
     This is a standalone function for plotting one graph.
-    
+
     Args:
         graph: The PlotGraph object to visualize.
         title: Title for the plot.
@@ -258,14 +289,30 @@ def plot_graph(
         show_grid: If True, display the grid.
     """
     fig, ax = plt.subplots(figsize=(8, 4))
-    
-    plot_graph_on_ax(ax, graph, title, show_ids=show_ids, show_blobs=show_blobs, show_grid=show_grid)
-    
+
+    plot_graph_on_ax(ax, graph, title, show_ids=show_ids, show_blobs=show_blobs, show_legend=False, show_grid=show_grid, show_coordinates=show_coordinates)
+
+    legend_by_label: Dict[str, matplotlib.artist.Artist] = {}
+    handles, labels = ax.get_legend_handles_labels()
+    for handle, label in zip(handles, labels):
+        if label and not label.startswith('_') and label not in legend_by_label:
+            legend_by_label[label] = handle
+
+    if legend_by_label and show_legend:
+        fig.legend(
+            legend_by_label.values(),
+            legend_by_label.keys(),
+            loc='center left',
+            bbox_to_anchor=(1.0, 0.5),
+            bbox_transform=ax.transAxes,
+            frameon=True,
+        )
+
     plt.tight_layout()
-    
+
     if save_path:
         _save_figure_with_metadata(fig, save_path, dpi, metadata)
-        
+
     plt.show()
 
 
@@ -279,7 +326,9 @@ def plot_graphs(
     save_path: Optional[str] = None,
     dpi: int = 300,
     metadata: Optional[Any] = None,
-    show_grid: bool = False
+    show_grid: bool = False,
+    show_coordinates: bool = True,
+    show_legend: bool = False,
 ):
     """
     Visualizes multiple PlotGraphs side-by-side or in a grid.
@@ -319,23 +368,34 @@ def plot_graphs(
 
     for i, ax in enumerate(axes_flat):
         if i < n_graphs:
-            plot_graph_on_ax(ax, graph_list[i], current_titles[i], show_ids=show_ids, show_blobs=show_blobs, show_legend=False, show_grid=show_grid)
+            plot_graph_on_ax(ax, graph_list[i], current_titles[i], show_ids=show_ids, show_blobs=show_blobs, show_legend=False, show_grid=show_grid, show_coordinates=show_coordinates)
         else:
             ax.axis('off')
-            
-    # Create unified legend
-    handles_dict = {}
+
+    # Let matplotlib manage legend placement outside the subplot area.
+    legend_by_label: Dict[str, matplotlib.artist.Artist] = {}
     for i in range(n_graphs):
-        h, l = axes_flat[i].get_legend_handles_labels()
-        for handle, label in zip(h, l):
-            if label not in handles_dict:
-                handles_dict[label] = handle
-                
-    if handles_dict:
-        fig.legend(handles_dict.values(), handles_dict.keys(), loc='lower center', ncol=len(handles_dict), bbox_to_anchor=(0.5, 0.00))
-        plt.tight_layout(rect=[0, 0.05, 1, 1])
+        handles, labels = axes_flat[i].get_legend_handles_labels()
+        for handle, label in zip(handles, labels):
+            if label and not label.startswith('_') and label not in legend_by_label:
+                legend_by_label[label] = handle
+
+    if legend_by_label and show_legend:
+        fig.legend(
+            legend_by_label.values(),
+            legend_by_label.keys(),
+            loc='center left',
+            bbox_to_anchor=(0.84, 0.5),
+            bbox_transform=fig.transFigure,
+            frameon=True,
+        )
+
+    # Use a uniform layout policy across all combined plots to keep
+    # subplot spacing consistent in paper figures.
+    if legend_by_label:
+        fig.subplots_adjust(left=0.08, right=0.82, bottom=0.10, top=0.92, wspace=0.25, hspace=0.25)
     else:
-        plt.tight_layout()
+        fig.subplots_adjust(left=0.08, right=0.98, bottom=0.10, top=0.92, wspace=0.25, hspace=0.25)
     
     if save_path:
          _save_figure_with_metadata(fig, save_path, dpi, metadata)
@@ -343,11 +403,71 @@ def plot_graphs(
     plt.show()
 
 
+def plot_pareto_scatter(
+    scatter_groups: List[Tuple[List[Tuple[float, float]], str, str, str]],
+    pareto_points: List[Tuple[float, float]],
+    reference_points: Optional[List[Tuple[Tuple[float, float], str, str, str]]] = None,
+    title: str = 'Pareto Front Scatter',
+    xlabel: str = 'Objective 1',
+    ylabel: str = 'Objective 2',
+    figsize: Tuple[int, int] = (6, 4),
+    save_path: Optional[str] = None,
+    dpi: int = 300,
+    metadata: Optional[Any] = None,
+):
+    """
+    Visualizes Pareto front against sets of multi-objective points.
+    
+    Args:
+        scatter_groups: List of (points, label, marker, color) tuples for plotting result clouds.
+        pareto_points: List of (x, y) coordinates on the Pareto front.
+        reference_points: Optional list of tuples formatted as (point, label, marker, color).
+        title: Plot title.
+        xlabel: Label for X-axis.
+        ylabel: Label for Y-axis.
+        save_path: If provided, save figure to this path.
+        dpi: Resolution for saving.
+        metadata: Optional metadata to embed for PNG saves.
+    """
+    fig, ax = plt.subplots(figsize=figsize)
+
+    for points, label, marker, color in scatter_groups:
+        if points:
+            xs, ys = zip(*points)
+            ax.scatter(xs, ys, label=label, marker=marker, color=color, alpha=0.7, s=60)
+
+    # Pareto front
+    if pareto_points:
+        # Sort points by X coordinate to draw a coherent line
+        sorted_pareto = sorted(pareto_points, key=lambda p: p[0])
+        pareto_xs, pareto_ys = zip(*sorted_pareto)
+        ax.plot(pareto_xs, pareto_ys, color='red', linestyle='--', linewidth=1.5, zorder=1)
+        ax.scatter(pareto_xs, pareto_ys, edgecolors='red', facecolors='none', s=120, linewidth=2, label='Pareto Front', zorder=2)
+
+    # Optional reference points
+    if reference_points:
+        for pt, lbl, marker, color in reference_points:
+            ax.scatter([pt[0]], [pt[1]], marker=marker, color=color, s=150, label=lbl, zorder=5)
+
+    ax.legend(fontsize='small', bbox_to_anchor=(1.05, 1), loc='upper left')
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.grid(True, linestyle='--', alpha=0.6)
+    plt.tight_layout()
+    
+    if save_path:
+        _save_figure_with_metadata(fig, save_path, dpi, metadata)
+        
+    plt.show()
+
+
 def plot_graph_evolution(graph_list: List[PlotGraph], 
                            titles: Optional[List[str]] = None,
                            show_ids: bool = False,
                            show_blobs: bool = True,
-                           show_grid: bool = False):
+                           show_grid: bool = False,
+                           show_coordinates: bool = True):
     """
     Visualizes a list of PlotGraph objects with an interactive slider.
     
@@ -397,7 +517,7 @@ def plot_graph_evolution(graph_list: List[PlotGraph],
         
         # 2. PLOT new artists (using setup_axis=False)
         # This only plots data, no clearing or re-formatting
-        current_artists = plot_graph_on_ax(ax, graph, title, setup_axis=False, show_ids=show_ids, show_blobs=show_blobs, show_grid=show_grid)
+        current_artists = plot_graph_on_ax(ax, graph, title, setup_axis=False, show_ids=show_ids, show_blobs=show_blobs, show_grid=show_grid, show_coordinates=show_coordinates)
         
         # 3. Redraw the canvas
         fig.canvas.draw_idle()
@@ -425,341 +545,8 @@ def plot_graph_evolution(graph_list: List[PlotGraph],
     
     # Call with setup_axis=True (the default) to clear, format,
     # and plot the first frame. Store the artists.
-    current_artists = plot_graph_on_ax(ax, initial_graph, initial_title, show_ids=show_ids, show_blobs=show_blobs, show_grid=show_grid)
+    current_artists = plot_graph_on_ax(ax, initial_graph, initial_title, show_ids=show_ids, show_blobs=show_blobs, show_grid=show_grid, show_coordinates=show_coordinates)
     
-    plt.show()
-
-@dataclass
-class RunStatsPlot:
-    """
-    An algorithm-agnostic class for plotting statistics of evolutions for
-    the evlutionary algorithms we consider.
-    """
-    title: str
-    # the metrics that are to be visualized, e.g., "avg fitness"
-    # each single metric should get its own line
-    # TODO: add some styling control here
-    metrics: List[str]
-    # for each generation, a dict of metrics with values
-    values: List[Dict[str, float]]
-
-def plot_training(
-    runs: List[RunStatsPlot], 
-    title: str = "Evolution Performance",
-    use_time_axis: bool = False,
-    legend: bool = True,
-    save_path: Optional[str] = None,
-    dpi: int = 300,
-    metadata: Optional[Any] = None
-):
-    """
-    Plots the training statistics for one or more algorithm runs.
-    
-    This function creates one subplot for each unique metric
-    (e.g., "avg_fitness", "max_fitness") and plots the data
-    from all provided runs on that subplot for comparison.
-    
-    The order of the subplots is determined by the order of metrics
-    in the first run object (runs[0]).
-
-    Args:
-        runs: A list of RunStatsPlot data objects.
-        title: The overall title for the figure.
-        use_time_axis: If True, uses the "time" metric from the
-                       data for the x-axis instead of "Generation".
-    """
-    
-    # 1. Determine the order and list of metrics to plot
-    if not runs:
-        print("No runs to plot.")
-        return
-
-    # Use the first run's metrics (excluding "time") as the base order
-    base_ordered_metrics = [m for m in runs[0].metrics if m != "time"]
-    base_metrics_set = set(base_ordered_metrics)
-
-    # Collect all unique metrics from all runs (excluding "time")
-    all_metrics_set: Set[str] = set()
-    for run in runs:
-        all_metrics_set.update(m for m in run.metrics if m != "time")
-        
-    # Create the final list of metrics to plot
-    # Start with the base order
-    final_plot_metrics = list(base_ordered_metrics)
-    
-    # Add any metrics that were in other runs but not the first one
-    # We sort the remaining set to ensure a consistent, non-random order
-    # for these "extra" metrics.
-    for metric in sorted(all_metrics_set):
-        if metric not in base_metrics_set:
-            final_plot_metrics.append(metric)
-
-    n_metrics = len(final_plot_metrics)
-
-    if n_metrics == 0:
-        print("No metrics to plot (excluding 'time').")
-        return
-
-    # 2. Create a figure with a subplot for each metric
-    fig, axes = plt.subplots(
-        n_metrics, 1, 
-        figsize=(8, 2 * n_metrics),
-        sharex=True, 
-        squeeze=False
-    )
-
-    # Create a simple mapping from metric name to its axis
-    # This now uses the new final_plot_metrics list for ordering
-    ax_map = {metric: axes[i, 0] for i, metric in enumerate(final_plot_metrics)}
-    
-    # Determine the x-axis label based on the toggle
-    x_label = "Time (seconds)" if use_time_axis else "Generation"
-
-    # 3. Plot data for each run
-    for run in runs:
-        
-        # Determine the x-axis values for this run
-        if use_time_axis:
-            if "time" not in run.metrics:
-                print(f"Warning: 'use_time_axis' is True but "
-                      f"run '{run.title}' is missing 'time' metric. Skipping run.")
-                continue
-            x_values = [gen_data.get("time", np.nan) for gen_data in run.values]
-        else:
-            x_values = range(len(run.values))
-        
-        for metric_name in run.metrics:
-            if metric_name in ax_map:
-                ax = ax_map[metric_name]
-                y_values = [
-                    gen_data.get(metric_name, np.nan) 
-                    for gen_data in run.values
-                ]
-                ax.plot(
-                    x_values,
-                    y_values, 
-                    label=run.title, 
-                    marker='.', 
-                    markersize=4, 
-                    alpha=0.8
-                )
-
-    # 4. Format all subplots
-    # This loop also respects the new order from final_plot_metrics
-    for i, metric_name in enumerate(final_plot_metrics):
-        ax = axes[i, 0]
-        ax.set_title(metric_name.replace('_', ' ').title())
-        ax.set_ylabel("Value")
-        if legend:
-            ax.legend()
-        ax.grid(True, linestyle='--', alpha=0.6)
-
-    # 5. Set shared X-axis label on the bottom plot
-    axes[-1, 0].set_xlabel(x_label)
-    
-    fig.suptitle(title, fontsize=16)
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    
-    if save_path:
-        _save_figure_with_metadata(fig, save_path, dpi, metadata)
-        
-    plt.show()
-
-def evolution_video(
-    graph_list: List[PlotGraph],
-    filename: str = "evolution.mp4",
-    fps: int = 5,
-    titles: Optional[List[str]] = None,
-    dpi: int = 300,
-    show_blobs: bool = True
-):
-    """
-    Generates a video (MP4 or GIF) from a list of PlotGraph objects.
-
-    Args:
-        graph_list: The sequence of graphs to animate.
-        filename: Output filename (e.g., 'video.mp4' or 'animation.gif').
-        fps: Frames per second.
-        titles: Optional list of titles for each frame.
-        dpi: Dots per inch for the output video resolution.
-        show_blobs: If True (default), display flexible nodes as green circles.
-    """
-    if not graph_list:
-        print("Graph list is empty. Cannot generate video.")
-        return
-
-    n_graphs = len(graph_list)
-
-    # --- Handle Titles ---
-    if titles is None:
-        plot_titles = [f"Generation {i}" for i in range(n_graphs)]
-    elif len(titles) != n_graphs:
-        print(f"Warning: Title count ({len(titles)}) mismatch with graphs ({n_graphs}).")
-        plot_titles = [f"Graph {i}" for i in range(n_graphs)]
-    else:
-        plot_titles = titles
-
-    # --- Setup Figure ---
-    fig, ax = plt.subplots(figsize=(8, 4))
-
-    print(f"Generating video '{filename}' with {n_graphs} frames...")
-
-    # Progress helpers
-    last_reported = {"frame": -1}
-    report_every = max(1, n_graphs // 50)  # ~50 updates max
-
-    def update(frame_idx):
-        # Plot frame
-        graph = graph_list[frame_idx]
-        title = plot_titles[frame_idx]
-        plot_graph_on_ax(ax, graph, title, setup_axis=True, show_blobs=show_blobs)
-
-        # Progress output
-        if (
-            frame_idx == 0
-            or frame_idx == n_graphs - 1
-            or (frame_idx - last_reported["frame"]) >= report_every
-        ):
-            pct = 100.0 * (frame_idx + 1) / n_graphs
-            print(f"Rendering frame {frame_idx + 1}/{n_graphs} ({pct:5.1f}%)")
-            last_reported["frame"] = frame_idx
-
-        return []
-
-    # --- Create Animation ---
-    anim = FuncAnimation(
-        fig,
-        update,
-        frames=n_graphs,
-        interval=1000 / fps,  # interval is in milliseconds
-        blit=False
-    )
-
-    # --- Save to File ---
-    try:
-        if filename.lower().endswith('.gif'):
-            writer = PillowWriter(fps=fps)
-            anim.save(filename, writer=writer, dpi=dpi)
-        else:
-            # Assumes ffmpeg is installed for MP4
-            writer = FFMpegWriter(fps=fps, metadata=dict(artist='Me'), bitrate=fps*40)
-            anim.save(filename, writer=writer, dpi=dpi)
-
-        print(f"Successfully saved video to {filename}")
-    except Exception as e:
-        print(f"Error saving video: {e}")
-        print("Ensure ffmpeg is installed for .mp4, or try saving as .gif")
-    finally:
-        plt.close(fig)
-
-def calculate_pareto_mask_maximization(data: np.ndarray) -> np.ndarray:
-    """
-    Finds the non-dominated set (Pareto front) for a Maximization problem.
-    Returns a boolean mask where True = Pareto efficient.
-    """
-    n_points = data.shape[0]
-    is_pareto = np.ones(n_points, dtype=bool)
-    
-    for i in range(n_points):
-        # Compare point i with all other points
-        # A point is dominated if another point is:
-        # >= in all objectives AND > in at least one objective
-        all_greater_or_equal = np.all(data >= data[i], axis=1)
-        any_strictly_greater = np.any(data > data[i], axis=1)
-        
-        is_dominated = np.any(all_greater_or_equal & any_strictly_greater)
-        
-        if is_dominated:
-            is_pareto[i] = False
-            
-    return is_pareto
-
-def plot_pareto_fronts(
-    population_objectives: List[Tuple[float, ...]],
-    objective_labels: Optional[List[str]] = None,
-    title: str = "Pareto Front (Maximization)"
-):
-    if not population_objectives:
-        print("No population data to plot.")
-        return
-
-    # --- Data Prep ---
-    data = np.array(population_objectives)
-    n_points, n_dims = data.shape
-    
-    # Calculate Pareto Front (Maximization logic)
-    pareto_mask = calculate_pareto_mask_maximization(data)
-
-    # Handle Labels
-    if objective_labels is None:
-        objective_labels = [f"Obj {i+1}" for i in range(n_dims)]
-    elif len(objective_labels) != n_dims:
-        objective_labels = [f"Obj {i+1}" for i in range(n_dims)]
-
-    # --- Setup Figure ---
-    # Reduced figure size (was 10,6)
-    fig = plt.figure(figsize=(6, 4))
-    
-    # Styles
-    # Reduced point sizes (s)
-    style_dominated = {
-        'c': 'gray', 'alpha': 0.3, 's': 10, 'marker': 'o', 'label': 'Dominated'
-    }
-    style_pareto = {
-        'c': 'firebrick', 'alpha': 1.0, 's': 30, 'marker': 'o', 'label': 'Pareto Front'
-    }
-
-    # Determine Plot Type
-    if n_dims == 2:
-        ax = fig.add_subplot(111)
-        
-        # Plot Dominated
-        ax.scatter(data[~pareto_mask, 0], data[~pareto_mask, 1], **style_dominated)
-        # Plot Pareto
-        ax.scatter(data[pareto_mask, 0], data[pareto_mask, 1], **style_pareto)
-        
-        ax.set_xlabel(objective_labels[0])
-        ax.set_ylabel(objective_labels[1])
-        ax.grid(True, linestyle='--', alpha=0.5)
-        
-        # Move legend to outside/top or keep small
-        ax.legend(fontsize='small')
-
-    elif n_dims == 3:
-        ax = fig.add_subplot(111, projection='3d')
-        
-        # Plot Dominated
-        ax.scatter(data[~pareto_mask, 0], data[~pareto_mask, 1], data[~pareto_mask, 2], 
-                   **style_dominated)
-        # Plot Pareto
-        ax.scatter(data[pareto_mask, 0], data[pareto_mask, 1], data[pareto_mask, 2], 
-                   **style_pareto)
-        
-        ax.set_xlabel(objective_labels[0])
-        ax.set_ylabel(objective_labels[1])
-        ax.set_zlabel(objective_labels[2])
-        ax.legend(fontsize='small')
-
-    else:
-        # Parallel Coordinates
-        ax = fig.add_subplot(111)
-        x_range = range(n_dims)
-        
-        # Dominated lines
-        for row in data[~pareto_mask]:
-            ax.plot(x_range, row, c='gray', alpha=0.15, linewidth=0.8)
-            
-        # Pareto lines
-        for row in data[pareto_mask]:
-            ax.plot(x_range, row, c='firebrick', alpha=0.9, linewidth=1.5)
-
-        ax.set_xticks(x_range)
-        ax.set_xticklabels(objective_labels)
-        ax.grid(True, axis='x', alpha=0.5)
-        ax.set_ylabel("Objective Value")
-
-    ax.set_title(title, fontsize=10)
-    plt.tight_layout()
     plt.show()
 
 @dataclass
@@ -772,7 +559,7 @@ class ConfigComparisonExperimentRun:
 def _plot_config_performance_comparison_single(
     ax: plt.Axes,
     ax2: plt.Axes,
-    runs: List[ConfigComparisonExperimentRun],
+    runs: List[SweepConfigResult],
     show_means: bool = True,
     show_std: bool = True,
     ylim: Optional[Tuple[float, float]] = None,
@@ -782,12 +569,13 @@ def _plot_config_performance_comparison_single(
     Core plotting function for a single experiment result on given axes.
     Returns legend elements for later use.
     """
-    # Extract data from runs objects
+
+    # Extract data from SweepConfigResult objects
     success_results = [np.array(r.successes) for r in runs]
     failure_probabilities = [r.failure_prob for r in runs]
     labels = [r.label for r in runs]
 
-    x = np.arange(1, len(success_results) + 1)
+    x = np.arange(len(success_results))
     
     # Colors
     COLOR_DOTS = '#1f77b4'
@@ -795,43 +583,36 @@ def _plot_config_performance_comparison_single(
     COLOR_MEDIAN = '#2ca02c'
     COLOR_FAIL = '#555555'
     
-    # --- Plot Data (Primary Axis) ---
+    # --- Plot Data using Seaborn (Primary Axis) ---
+    import pandas as pd
     
-    # A. Boxplot
-    ax.boxplot(
-        success_results, 
-        positions=x, 
-        showfliers=False, 
-        patch_artist=True,
-        boxprops=dict(facecolor='#EBF5FB', color=COLOR_DOTS, alpha=0.5, linewidth=1),
-        medianprops=dict(color=COLOR_MEDIAN, linewidth=2.5),
-        whiskerprops=dict(visible=False),
-        capprops=dict(visible=False),
-        widths=0.6,
-        zorder=1
-    )
-    
-    # B. Scatter points
+    # Prepare data for seaborn
+    plot_data = []
     for i, r in enumerate(success_results):
-        if len(r) == 0: continue
-        jitter = np.random.normal(0, 0.05, size=len(r))
-        ax.scatter(
-            np.full_like(r, x[i]) + jitter, 
-            r, 
-            color=COLOR_DOTS, 
-            alpha=0.6,
-            s=25,
-            edgecolors='white',
-            linewidth=0.8,
-            zorder=3
+        for val in r:
+             plot_data.append({'Config': labels[i], 'Generations': val, 'x_pos': x[i]})
+    
+    if plot_data:
+        df = pd.DataFrame(plot_data)
+        sns.boxplot(
+            data=df, x='x_pos', y='Generations', order=x.tolist(),
+            ax=ax, color='#EBF5FB', boxprops=dict(alpha=0.5, edgecolor=COLOR_DOTS), 
+            medianprops=dict(color=COLOR_MEDIAN, linewidth=2.5),
+            whiskerprops=dict(visible=False), capprops=dict(visible=False),
+            showfliers=False, width=0.6, zorder=1
+        )
+        sns.stripplot(
+            data=df, x='x_pos', y='Generations', order=x.tolist(),
+            ax=ax, color=COLOR_DOTS, size=5, alpha=0.6, 
+            edgecolor='white', linewidth=0.8, jitter=True, zorder=3
         )
     
     # C. Mean and Standard Deviation
     if show_means or show_std:
-        means = [r.mean() if len(r) > 0 else np.nan for r in success_results]
+        means = [float(np.mean(r)) if len(r) > 0 else np.nan for r in success_results]
         
         if show_std:
-            stds = [r.std() if len(r) > 0 else 0.0 for r in success_results]
+            stds = [float(np.std(r)) if len(r) > 0 else 0.0 for r in success_results]
             lower_errors = [min(std, mean) if not np.isnan(mean) else 0.0 
                            for mean, std in zip(means, stds)]
             upper_errors = stds
@@ -862,6 +643,7 @@ def _plot_config_performance_comparison_single(
     ax.set_ylabel('Number of generations', fontsize=11, fontweight='bold', color='#333333')
     if title:
         ax.set_title(title, fontsize=13, fontweight='bold', pad=15)
+    ax.set_xlabel('Algorithm Configurations', fontsize=11)
     
     if ylim is not None:
         ax.set_ylim(ylim)
@@ -890,9 +672,9 @@ def _plot_config_performance_comparison_single(
     # --- X-axis labels ---
     if labels:
         ax.set_xticks(x)
-        ax.set_xticklabels(labels, rotation=20, ha='right', fontsize=10)
-    
-    ax.set_xlabel('Algorithm Configurations', fontsize=11)
+        ax.set_xticklabels(labels)
+        ax.tick_params(axis='x', labelsize=10)
+        plt.setp(ax.get_xticklabels(), rotation=20, ha='right')
     
     # Return legend elements
     legend_elements = [
@@ -908,7 +690,7 @@ def _plot_config_performance_comparison_single(
     return legend_elements
 
 def plot_config_performance_comparison(
-    runs: List[ConfigComparisonExperimentRun],
+    runs: List[SweepConfigResult],
     title: str = 'Experiment Results',
     show_means: bool = True,
     show_std: bool = True,
@@ -942,28 +724,35 @@ def plot_config_performance_comparison(
         
         plt.tight_layout()
         if save_path:
-            metadata = [r.meta for r in runs]
+            metadata = [r.config_meta for r in runs]
             _save_figure_with_metadata(fig, save_path, dpi, metadata)
         plt.show()
 
 def plot_config_performance_comparison_multi(
-    list_of_runs: List[List[ConfigComparisonExperimentRun]],
+    runs_grid: Optional[Any] = None,
+    titles_grid: Optional[Any] = None,
+    list_of_runs: Optional[List[List[SweepConfigResult]]] = None,
     list_of_titles: Optional[List[str]] = None,
-    horizontal: bool = True,
+    horizontal: Optional[bool] = None,
     show_means: bool = True,
     show_std: bool = True,
     figsize: Optional[Tuple[float, float]] = None,
     y_max: Optional[float] = None,
     save_path: Optional[str] = None,
     dpi: int = 300,
+    legend_pos: str = 'inside',
 ):
     """
-    Plot multiple experiment results in a single figure with shared legend.
+    Plot multiple experiment results in a 2D subplot grid with a shared legend.
     
     Args:
-        list_of_runs: List of lists of ConfigComparisonExperimentRun objects (one list per subplot)
-        list_of_titles: List of titles (one per subplot)
-        horizontal: If True, arrange subplots horizontally; if False, vertically
+        runs_grid: 2D array-like where each entry is a list of
+            ConfigComparisonExperimentRun objects for one subplot.
+        titles_grid: Optional 2D array-like of subplot titles with same shape as runs_grid.
+        list_of_runs: Legacy 1D layout input (deprecated). If provided and
+            runs_grid is None, it will be converted into a 2D grid.
+        list_of_titles: Legacy 1D titles input (deprecated).
+        horizontal: Legacy layout switch for 1D input conversion.
         show_means: Show mean markers
         show_std: Show standard deviation error bars
         figsize: Figure size tuple (width, height). If None, auto-calculated
@@ -976,11 +765,57 @@ def plot_config_performance_comparison_multi(
     except OSError:
         style = 'ggplot'
     
-    n_plots = len(list_of_runs)
+    if runs_grid is None and list_of_runs is not None:
+        if horizontal is False:
+            runs_grid = [[runs] for runs in list_of_runs]
+            if list_of_titles is not None:
+                titles_grid = [[title] for title in list_of_titles]
+        else:
+            runs_grid = [list_of_runs]
+            if list_of_titles is not None:
+                titles_grid = [list_of_titles]
+
+    if runs_grid is None:
+        raise ValueError("runs_grid is required")
+
+    if isinstance(runs_grid, np.ndarray):
+        if runs_grid.ndim != 2:
+            raise ValueError("runs_grid must be a 2D array-like structure")
+        normalized_runs_grid = runs_grid.astype(object, copy=False)
+    else:
+        rows = list(runs_grid)
+        if len(rows) == 0:
+            raise ValueError("runs_grid must not be empty")
+        row_lengths = [len(row) for row in rows]
+        if any(length != row_lengths[0] for length in row_lengths):
+            raise ValueError("runs_grid rows must have the same length")
+        normalized_runs_grid = np.empty((len(rows), row_lengths[0]), dtype=object)
+        for row_idx, row in enumerate(rows):
+            for col_idx, runs in enumerate(row):
+                normalized_runs_grid[row_idx, col_idx] = runs
+
+    runs_grid = normalized_runs_grid
+
+    n_rows, n_cols = runs_grid.shape
+
+    if titles_grid is not None:
+        if isinstance(titles_grid, np.ndarray):
+            titles_grid = titles_grid.astype(object, copy=False)
+        else:
+            title_rows = list(titles_grid)
+            titles_grid_arr = np.empty((len(title_rows), len(title_rows[0]) if title_rows else 0), dtype=object)
+            for row_idx, row in enumerate(title_rows):
+                if len(row) != titles_grid_arr.shape[1]:
+                    raise ValueError("titles_grid rows must have the same length")
+                for col_idx, title in enumerate(row):
+                    titles_grid_arr[row_idx, col_idx] = title
+            titles_grid = titles_grid_arr
+        if titles_grid.shape != runs_grid.shape:
+            raise ValueError("titles_grid must have the same shape as runs_grid")
     
     # Calculate shared y-axis limits across all result sets to ensure comparable scales
     all_success_data = []
-    for runs in list_of_runs:
+    for runs in runs_grid.flat:
         for r in runs:
             if len(r.successes) > 0:
                 all_success_data.extend(r.successes)
@@ -995,48 +830,50 @@ def plot_config_performance_comparison_multi(
     
     # Auto-calculate figsize if not provided
     if figsize is None:
-        if horizontal:
-            figsize = (8 * n_plots, 6)
-        else:
-            figsize = (10, 5 * n_plots)
-            
+        figsize = (6 * n_cols, 4.5 * n_rows)
+    
     with plt.style.context(style):
-        if horizontal:
-            fig, axes = plt.subplots(1, n_plots, figsize=figsize)
-        else:
-            fig, axes = plt.subplots(n_plots, 1, figsize=figsize)
-        
-        # Ensure axes is iterable
-        if n_plots == 1:
-            axes = [axes]
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize, squeeze=False)
         
         legend_elements = None
-    
-        for i in range(n_plots):
-            ax = axes[i]
-            ax2 = ax.twinx()
-            
-            runs = list_of_runs[i]
-            
-            title = list_of_titles[i] if list_of_titles else None
-            
-            legend_elements = _plot_config_performance_comparison_single(
-                ax, ax2, runs, show_means, show_std, shared_ylim, title
-            )
+
+        for row_idx in range(n_rows):
+            for col_idx in range(n_cols):
+                ax = axes[row_idx, col_idx]
+                ax2 = ax.twinx()
+                runs = runs_grid[row_idx, col_idx]
+
+                title = titles_grid[row_idx, col_idx] if titles_grid is not None else None
+
+                legend_elements = _plot_config_performance_comparison_single(
+                    ax, ax2, runs, show_means, show_std, shared_ylim, title
+                )
         
-        # Add legend inside the last data plot
-        if legend_elements and n_plots > 0:
-            axes[n_plots - 1].legend(
-                handles=legend_elements,
-                loc='upper right',
-                frameon=True,
-                title="Legend",
-                fontsize='small',
-                framealpha=0.95
-            )
+        # Add exactly one legend based on legend_pos
+        if legend_elements:
+            legend_ax = axes[0, n_cols - 1]
+            if legend_pos == 'inside':
+                legend_ax.legend(
+                    handles=legend_elements,
+                    loc='upper right',
+                    frameon=True,
+                    title="Legend",
+                    fontsize='small',
+                    framealpha=0.95
+                )
+            elif legend_pos == 'outside':
+                # Use bbox_to_anchor bounded to the uppermost right axes, NOT the figure.
+                # Shift x by ~1.15 to clear the secondary y-axis label ("Failure Probability").
+                legend_ax.legend(
+                    handles=legend_elements,
+                    loc='center left',
+                    bbox_to_anchor=(1.18, 0.5), 
+                    frameon=True,
+                    title="Legend",
+                )
         
         plt.tight_layout()
         if save_path:
-            list_of_metadata = [[r.meta for r in runs] for runs in list_of_runs]
+            list_of_metadata = [[[r.config_meta for r in runs] for runs in row] for row in runs_grid.tolist()]
             _save_figure_with_metadata(fig, save_path, dpi, list_of_metadata)
         plt.show()

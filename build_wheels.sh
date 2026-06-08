@@ -2,7 +2,7 @@
 set -e
 
 # Array of Python versions to build for
-PYTHON_VERSIONS=("3.8" "3.9" "3.10" "3.11" "3.12")
+PYTHON_VERSIONS=("3.10" "3.11" "3.12")
 
 # Clean dist directory
 rm -rf dist/

@@ -5,67 +5,8 @@ import time
 from abc import ABC, abstractmethod
 from copy import deepcopy
 import numpy as np
-from enum import IntEnum, auto
 
-# --- enums & config ---
-
-class SelectionStrategy(IntEnum):
-    NEAT = auto()   # generational replacement
-    NSGA2 = auto()  # pareto fronts and best from pool
-    SPEA2 = auto()  # domination strength and best from pool
-
-class MatingStrategy(IntEnum):
-    NEATSpeciation = auto()     # mating within species
-    GlobalTournament = auto()   # global mating, no species
-
-class MultiObjectiveStratgy(IntEnum):
-    NSGA2 = auto()
-    SPEA2 = auto()
-
-@dataclass
-class NEATConfig:
-    """
-    Stores all hyperparameters and settings for the NEAT algorithm.
-    """
-    # population settings
-    population_size: int = 100
-    
-    # mutation probabilities
-    add_node_mutation_prob: float = 0.4
-    add_edge_mutation_prob: float = 0.4
-    remove_edge_mutation_prob: float = 0.1
-    remove_node_mutation_prob: float = 0.1
-    remove_node_single_mutation_prob: float = 0.1
-
-    # reproduction/selection settings
-    num_elites_species: int = 1     # number of best genomes from each species to carry over
-    num_elites_global: int = 1      # number of best genomes from entire population to carry over
-    selection_share: float = 0.2    # fraction of top genomes (within a species) eligible for reproduction
-    tournament_size: int = 2
-
-    # speciation settings
-    species_threshold: float = 3.0          # compatibility distance threshold for speciation
-    target_species: Optional[int] = None
-    # min_species_threshold: float = 0.15     # minimum value for adaptive thresholding
-    # max_species_threshold: float = 15.0     # maximum value for adaptive thresholding
-    # target_species_number: int = 15         # target number of species for adaptive thresholding
-    # adaptive_threshold: float = 0.0         # step size for adjusting threshold (0 disables)
-
-    # high-level strategies (default: vanilla NEAT, single-objective)
-    mating_strategy: MatingStrategy = MatingStrategy.NEATSpeciation
-    selection_strategy: SelectionStrategy = SelectionStrategy.NEAT
-    diversity_objective: bool = False  # only makes sense with multi-objective selection strategy
-    crossover_enabled: bool = True
-    
-    # compatibility distance coefficients
-    c1: float = 1.0  # excess genes
-    c2: float = 1.0  # disjoint genes
-    
-    # run settings
-    save_path: str = "./"
-    
-    # specialization-specific config (should be a dataclass)
-    special: Any = None
+from neatwork.types import MatingStrategy, NEATCoreConfig
 
 # --- specialization interface ---
 
@@ -78,7 +19,7 @@ class NEATSpecialization(ABC):
     An instance of a subclass will be shared by all genomes.
     """
 
-    def __init__(self, config: NEATConfig):
+    def __init__(self, config: NEATCoreConfig):
         self.config = config
     
     # --- hooks ---
@@ -246,7 +187,7 @@ class Genome:
     """
     def __init__(
             self, 
-            config: NEATConfig,
+            config: NEATCoreConfig,
             specialization: NEATSpecialization,
             population: 'Population',
             edges: Optional[Dict[EdgeID, Edge]] = None,
@@ -256,11 +197,10 @@ class Genome:
         assert (edges is None) == (nodes is None)
         default_init = edges is None
 
-        self.config: NEATConfig = config
+        self.config: NEATCoreConfig = config
         self.specialization: NEATSpecialization = specialization
         self.population: 'Population' = population  # for accessing global innovation numbers
         self.fitness: float = 0.0
-        self.objectives: Optional[Tuple[float, ...]] = None # storage for multi-objective evaluations
         
         self.nodes: Dict[NodeID, Node] = nodes or {}
         self.edges: Dict[EdgeID, Edge] = edges or {}
@@ -287,7 +227,6 @@ class Genome:
             }, 
         )
         copied_genome.fitness = self.fitness
-        copied_genome.objectives = self.objectives
         return copied_genome
 
     @property
@@ -501,7 +440,7 @@ class Species:
     Speciation protects innovation by allowing genomes to compete
     primarily within their niche.
     """
-    def __init__(self, representative: Genome, config: NEATConfig):
+    def __init__(self, representative: Genome, config: NEATCoreConfig):
         self.config = config
         self.members = [representative]
         self.representative = representative
@@ -519,21 +458,6 @@ class Species:
             for genome in self.members:
                 genome.adj_fitness /= n
 
-    def offset_fitness(self):
-        """
-        Offsets fitness scores so the minimum fitness is slightly > 0.
-        Useful for fitness-proportionate selection methods.
-        """
-        if not self.members:
-            return []
-
-        f_min = min(g.fitness for g in self.members)
-        epsilon = 1e-7
-        offset = -f_min + epsilon if f_min < epsilon else 0.0
-
-        for genome in self.members:
-            genome.adj_fitness = genome.fitness + offset
-
     def sorted(self, reverse=True) -> List[Genome]:
         """Returns members sorted by fitness, descending."""
         return sorted(self.members, key=lambda g: g.fitness, reverse=reverse)
@@ -543,8 +467,8 @@ class Population:
     Manages the state of the population (genomes, IDs, species).
     All algorithmic logic (speciation, selection) has been moved to standalone functions.
     """
-    def __init__(self, config: NEATConfig, specialization: type[NEATSpecialization], start_genome: Optional[Genome] = None):
-        self.config: NEATConfig = config
+    def __init__(self, config: NEATCoreConfig, specialization: type[NEATSpecialization], start_genome: Optional[Genome] = None):
+        self.config: NEATCoreConfig = config
         self.specialization: NEATSpecialization = specialization(config=self.config)
         self.dynamic_species_threshold = config.species_threshold
         self.species: List[Species] = []
@@ -770,56 +694,16 @@ def make_offspring_global_tournament(pop: Population, n_offspring: int) -> Tuple
         children.append(crossover(pop, p1, p2))
     return elites, children
 
-def augment_with_diversity(pop: Population, genomes: List[Genome], evals: List[Any]) -> List[Tuple]:
-    """Calculates the average k-nearest neighbor distance and appends to objectives."""
-    
-    def to_tuple(f):
-        return tuple(f) if isinstance(f, (list, tuple)) else (float(f),)
-
-    n = len(genomes)
-
-    if n < 2:
-        return [to_tuple(f) + (0.0,) for f in evals]
-
-    k_neighbors = min(n - 1, 5)
-    
-    # O(N^2) compatibility matrix
-    dist_matrix = np.zeros((n, n))
-    for i in range(n):
-        for j in range(i + 1, n):
-            dist = calculate_compatibility(pop, genomes[i], genomes[j])
-            dist_matrix[i, j] = dist_matrix[j, i] = dist
-    
-    knn_avg_distances = []
-    for i in range(n):
-        dists = dist_matrix[i, :]
-        # sort distances (ascending). 0th is self (0.0)
-        partitioned_indices = np.argpartition(dists, k_neighbors + 1)[:k_neighbors + 1]
-        nearest_dists = dists[partitioned_indices]
-        nearest_dists.sort()
-        valid_neighbors = nearest_dists[1:k_neighbors+1]
-        
-        avg_dist = np.mean(valid_neighbors) if len(valid_neighbors) > 0 else 0.0
-        knn_avg_distances.append(avg_dist)
-
-    extended = []
-    for fit, dist in zip(evals, knn_avg_distances):
-        extended.append(to_tuple(fit) + (dist,))
-
-    return extended
-
 # --- policies namespaces ---
 
 class NEATSpeciation:
     """Namespace for Standard NEAT policies (Speciation, Sharing, Offspring)."""
 
     @staticmethod
-    def repseciate(pop: Population):
+    def respeciate(pop: Population):
         """
         Assigns genomes to species and updates the adaptive threshold.
         """
-        # TODO: verify correctness
-
         # clear old members from species
         for s in pop.species:
             s.members = []
@@ -873,12 +757,32 @@ class NEATSpeciation:
         children = []
         species_offspring = num_offspring - pop.config.num_elites_global
 
+        if pop.members:
+            valid_members = [g for g in pop.members if g.fitness > -float('inf')]
+            if not valid_members:
+                min_fit = 0.0
+                max_fit = 0.0
+            else:
+                min_fit = min(g.fitness for g in valid_members)
+                max_fit = max(g.fitness for g in valid_members)
+                
+            rng = max(max_fit - min_fit, 1e-7)
+            baseline = rng * 0.1
+            offset = -min_fit + baseline
+            for g in pop.members:
+                if g.fitness == -float('inf'):
+                    g.adj_fitness = 0.0
+                else:
+                    g.adj_fitness = g.fitness + offset
+        else:
+            for g in pop.members:
+                g.adj_fitness = g.fitness
+
         avg_fits = []
         for s in pop.species:
-            s.offset_fitness() # sets g.adj_fitness
             s.adjust_fitness() # divides g.adj_fitness by species size
             total = sum(g.adj_fitness for g in s.members)
-            avg_fits.append(total / len(s.members))
+            avg_fits.append(total)
         
         total_avg = sum(avg_fits)
         if total_avg == 0: total_avg = 1.0
@@ -890,7 +794,7 @@ class NEATSpeciation:
             s_members = s.sorted()
             
             # species elitism
-            n_elites = min(pop.config.num_elites_species, len(s_members))
+            n_elites = min(pop.config.num_elites_species, len(s_members), count)
             for i in range(n_elites):
                 elites.append(s_members[i].copy())
                 count -= 1
@@ -919,227 +823,7 @@ class NEATSpeciation:
     @staticmethod
     def select(pop: Population, elites: List[Genome], children: List[Genome]):
         pop.members = elites + children
-        NEATSpeciation.repseciate(pop)
-
-class NSGA2:
-    """Namespace for NSGA-II policies and helpers."""
-
-    @staticmethod
-    def fast_non_dominated_sort(objectives_array: np.ndarray) -> List[List[int]]:
-        """
-        Returns a list of fronts (list of indices). Front 0 is the pareto front.
-        (vectorized O(N^2) implementation)
-        """
-        n = objectives_array.shape[0]
-        
-        # broadcasting to create (N, N) boolean domination matrix
-        # A dominates B if A >= B for all objectives AND A > B for at least one
-        A = objectives_array[:, None, :]
-        B = objectives_array[None, :, :]
-        
-        dominates_all = np.all(A >= B, axis=2)
-        dominates_any = np.any(A > B, axis=2)
-        dominates_matrix = dominates_all & dominates_any
-
-        # count how many individuals dominate each 'i'
-        domination_counts = np.sum(dominates_matrix, axis=0) 
-        
-        fronts = []
-        remaining_indices = np.arange(n)
-        
-        while len(remaining_indices) > 0:
-            # members of current front are those not dominated by any remaining individual
-            is_front = domination_counts[remaining_indices] == 0
-            current_front = remaining_indices[is_front]
-            
-            if len(current_front) == 0:
-                fronts.append(remaining_indices.tolist())
-                break
-
-            fronts.append(current_front.tolist())
-
-            # update domination counts by removing effect of current front
-            front_dominance = dominates_matrix[current_front, :]
-            dominated_by_front_counts = np.sum(front_dominance, axis=0)
-            domination_counts -= dominated_by_front_counts
-            
-            remaining_indices = remaining_indices[~is_front]
-            
-        return fronts
-
-    @staticmethod
-    def calculate_crowding_distance(objectives_array: np.ndarray, fronts: List[List[int]]) -> np.ndarray:
-        """
-        Calculates crowding distance to maintain diversity within fronts.
-        Individuals with larger crowding distances are preferred (less crowded).
-        """
-        n, num_objs = objectives_array.shape
-        crowding_distances = np.zeros(n, dtype=np.float64)
-
-        for front in fronts:
-            if len(front) < 3:
-                crowding_distances[front] = float('inf')
-                continue
-
-            front_indices = np.array(front)
-            front_objs = objectives_array[front_indices]
-            
-            crowding_distances[front_indices] = 0.0
-
-            for m in range(num_objs):
-                # sort by objective m
-                order = np.argsort(front_objs[:, m])
-                sorted_objs = front_objs[order, m]
-                original_sorted_indices = front_indices[order]
-
-                # boundary points get infinite distance
-                crowding_distances[original_sorted_indices[0]] = float('inf')
-                crowding_distances[original_sorted_indices[-1]] = float('inf')
-
-                # normalize objective range
-                norm_range = sorted_objs[-1] - sorted_objs[0]
-                if norm_range == 0: 
-                    norm_range = 1.0
-
-                # distance is difference between neighbors normalized
-                dist_m = (sorted_objs[2:] - sorted_objs[:-2]) / norm_range
-                crowding_distances[original_sorted_indices[1:-1]] += dist_m
-                
-        return crowding_distances
-
-    @staticmethod
-    def get_pareto_front(individuals: List[Genome]) -> List[Genome]:
-        """
-        Returns the list of individuals that belong to the first Pareto front 
-        (Rank 1 / Non-dominated solutions).
-        """
-        if not individuals:
-            return []
-
-        try:
-            objs = np.array([g.objectives for g in individuals], dtype=np.float64)
-        except AttributeError:
-            # Fallback: assume top fitness is "Pareto" if objectives missing
-            return [max(individuals, key=lambda g: g.fitness)]
-
-        # fronts[0] contains the indices of the non-dominated solutions
-        fronts = NSGA2.fast_non_dominated_sort(objs)
-        
-        if not fronts:
-            return []
-
-        pareto_indices = fronts[0]
-        return [individuals[i] for i in pareto_indices]
-
-    @staticmethod
-    def process_fitness(genomes: List[Genome]):
-        objs = np.array([g.objectives for g in genomes], dtype=np.float64)
-        n = len(genomes)
-
-        fronts = NSGA2.fast_non_dominated_sort(objs)
-        crowding_dists = NSGA2.calculate_crowding_distance(objs, fronts)
-        
-        rank_array = np.zeros(n, dtype=int)
-        for r, front in enumerate(fronts):
-            rank_array[front] = r + 1
-
-        max_rank = len(fronts)
-        # scalarize back into single fitness value, it's easier to work with
-        # ensure low-rank >> high-rank; and high-crowd-dist >> low-crowd-dist
-        # TODO: verify correctness
-        for i, g in enumerate(genomes):
-            rank_score = (max_rank - rank_array[i] + 1) * (n + 1)
-            c_dist = crowding_dists[i]
-            if np.isinf(c_dist):
-                c_dist = objs.shape[1] * 2.0
-            g.fitness = rank_score + c_dist
-
-    @staticmethod
-    def select(pop: Population, elites: List[Genome], pool: List[Genome]):
-        pool.sort(key=lambda g: g.fitness, reverse=True)
-        pop.members = elites + pool[:pop.config.population_size-len(elites)]
-
-class SPEA2:
-    """Namespace for SPEA2 policies and helpers."""
-
-    @staticmethod
-    def calculate_metrics(objs_array: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Calculates SPEA2 metrics: Raw Fitness (domination strength) and Density.
-        Lower values are better for both.
-        """
-        n = objs_array.shape[0]
-        k_neighbor = int(np.sqrt(n))
-
-        # normalize objectives for distance calculation
-        min_vals = np.min(objs_array, axis=0)
-        max_vals = np.max(objs_array, axis=0)
-        ranges = max_vals - min_vals
-        ranges[ranges == 0] = 1.0
-        norm_objs = (objs_array - min_vals) / ranges
-
-        # calculate domination strength
-        A = objs_array[:, None, :]
-        B = objs_array[None, :, :]
-        dominates = np.all(A >= B, axis=2) & np.any(A > B, axis=2)
-
-        strength = np.sum(dominates, axis=1)
-        
-        raw_fitness = np.zeros(n)
-        for i in range(n):
-            # sum strengths of individuals that dominate i
-            dominators = np.where(dominates[:, i])[0]
-            raw_fitness[i] = np.sum(strength[dominators])
-
-        # calculate density based on k-th nearest neighbor
-        diff = norm_objs[:, None, :] - norm_objs[None, :, :]
-        dist_matrix = np.sqrt(np.sum(diff**2, axis=2))
-        
-        density = np.zeros(n)
-        for i in range(n):
-            dists = np.sort(dist_matrix[i])
-            k_idx = min(len(dists)-1, k_neighbor)
-            sigma_k = dists[k_idx]
-            density[i] = 1.0 / (sigma_k + 2.0)
-
-        return raw_fitness, density
-
-    @staticmethod
-    def get_pareto_front(individuals: List[Genome]) -> List[Genome]:
-        """
-        Returns the list of individuals that are non-dominated.
-        In SPEA2 terms, these are individuals with a Raw Fitness of 0.
-        """
-        if not individuals:
-            return []
-
-        try:
-            objs = np.array([g.objectives for g in individuals], dtype=np.float64)
-        except AttributeError:
-            return [max(individuals, key=lambda g: g.fitness)]
-
-        # We only need 'raw' fitness to determine domination status
-        raw, _ = SPEA2.calculate_metrics(objs)
-
-        # Indices where raw fitness is 0.0 are non-dominated
-        pareto_indices = np.where(raw == 0.0)[0]
-
-        return [individuals[i] for i in pareto_indices]
-
-    @staticmethod
-    def process_fitness(genomes: List[Genome]):
-        objs = np.array([g.objectives for g in genomes], dtype=np.float64)
-        # TODO: verify correctness
-        raw, density = SPEA2.calculate_metrics(objs)
-        spea2_score = raw + density
-        # invert because we MAXIMIZE objectives
-        scalar_fits = 1.0 / (spea2_score + 1.0)
-        for g, fit in zip(genomes, scalar_fits):
-            g.fitness = fit
-
-    @staticmethod
-    def select(pop: Population, elites: List[Genome], children: List[Genome]):
-        return NSGA2.select(pop, elites, children)
+        NEATSpeciation.respeciate(pop)
 
 # --- main interface ---
 
@@ -1152,7 +836,7 @@ class GenerationStatistics:
 
 @dataclass
 class RunStatistics:
-    config: NEATConfig
+    config: NEATCoreConfig
     start_time_sec: float
     gens: List[GenerationStatistics] = field(default_factory=list)
 
@@ -1200,69 +884,121 @@ class RunStatistics:
             else:
                 print("No top genomes recorded.")
 
-def run(
-    config: NEATConfig, 
-    f_eval: Callable[[List[Genome]], Union[List[float], List[Tuple]]], 
+def _precompute_threshold(
+    config: NEATCoreConfig,
+    f_eval: Callable[[List[Genome]], List[float]],
     specialization_cls,
-    ngen: Optional[int] = None, 
-    target_fit: Optional[float] = None, 
-    start_genome: Optional[Genome] = None, 
+    target_species: int,
+    gens: int = 15,
+    trials: int = 10,
+    print_: bool = True,
+) -> float:
+    """
+    Performs short runs to find a species threshold that yields roughly `target_species`.
+    Returns the calibrated threshold.
+    """
+    if print_:
+        print(f"--- Precomputing Threshold for {target_species} Species ---")
+
+    low = 0.1
+    high = 100.0
+
+    current = max(low, min(high, config.species_threshold))
+
+    best_thresh = current
+    min_diff = float('inf')
+
+    for i in range(trials):
+        temp_cfg = deepcopy(config)
+        temp_cfg.species_threshold = current
+
+        pop = Population(temp_cfg, specialization_cls)
+
+        def evaluate(genomes):
+            raw_evals = f_eval(genomes)
+            if len(raw_evals) == 0:
+                return
+            for g, f in zip(genomes, raw_evals):
+                g.fitness = f
+
+        evaluate(pop.members)
+        NEATSpeciation.respeciate(pop)
+
+        final_species = 0
+        for _ in range(gens):
+            elites, children = NEATSpeciation.make_offspring(pop, temp_cfg.population_size)
+            for child in children:
+                child.mutate()
+            offspring = elites + children
+            evaluate(offspring)
+            NEATSpeciation.select(pop, elites, children)
+            _, _, final_species, _ = pop.get_stats()
+
+        if print_:
+            print(f"  [Try {i+1}] Threshold {current:.4f} => {final_species} species (Goal: {target_species})")
+
+        diff = abs(final_species - target_species)
+        if diff < min_diff:
+            min_diff = diff
+            best_thresh = current
+
+        if final_species == target_species:
+            best_thresh = current
+            break
+
+        if final_species > target_species:
+            low = current
+        else:
+            high = current
+
+        current = (low + high) / 2.0
+
+    if print_:
+        print(f"--- Settled on Threshold {best_thresh:.4f} (Diff: {min_diff}) ---")
+    return best_thresh
+
+
+def run(
+    config: NEATCoreConfig,
+    f_eval: Callable[[List[Genome]], List[float]],
+    specialization_cls,
     print_: bool = True,
 ) -> Tuple[List[Genome], Population, RunStatistics]:
     """
     Runs the neat algorithm.
     This function acts as a factory, wiring up the pipeline functions based on config.
     """
+    ngen = config.ngen if config.ngen is not None else None
+    target_fit = config.target_fit
+    start_genome = config.start_genome
+    precompute_threshold = config.precompute_threshold
+
     assert ngen is not None or target_fit is not None
-    
+
+    if precompute_threshold:
+        new_thresh = _precompute_threshold(config, f_eval, specialization_cls, config.target_species, print_=print_)
+        config.species_threshold = new_thresh
+
     pop = Population(config, specialization_cls, start_genome=start_genome)
     stats = RunStatistics(config, start_time_sec=time.time())
     top_genomes = []
-    
+
     if ngen is None: ngen = int(1e6)
 
     def evaluate(genomes):
-        """
-        * runs user evaluation
-        * if single-objective: store in Genome.fitness
-        * if multi-objective: store in Genome.objectives
-        """
         raw_evals = f_eval(genomes)
         if len(raw_evals) == 0:
             return
-        is_scalar = isinstance(raw_evals[0], float) or isinstance(raw_evals[0], int)
-        if is_scalar:
-            for g,f in zip(genomes,raw_evals):
-                g.fitness = f
-        if config.diversity_objective:
-            raw_evals = augment_with_diversity(pop, genomes, raw_evals)
-        is_multi = not is_scalar or config.diversity_objective
-        if is_multi:
-            for g,o in zip(genomes,raw_evals):
-                g.objectives = o
-        return raw_evals
-    
-    def process_multi_obj(genomes):
-        # turns 'objectives' into 'fitness'
-        if len(genomes) == 0:
-            return
-        is_multi = genomes[0].objectives is not None
-        if not is_multi:
-            return
-        assert genomes[0].objectives is not None
-        if config.selection_strategy == SelectionStrategy.NSGA2:
-            NSGA2.process_fitness(genomes)
-        elif config.selection_strategy == SelectionStrategy.SPEA2:
-            SPEA2.process_fitness(genomes)
-    
+        for g,f in zip(genomes,raw_evals):
+            g.fitness = f
+
     n_offspring = config.population_size
 
-    # get initial evaluations and rankings to enable mating
+    # get initial evaluations to enable mating
     evaluate(pop.members)
-    process_multi_obj(pop.members)
 
     if config.mating_strategy == MatingStrategy.NEATSpeciation:
-        NEATSpeciation.repseciate(pop)
+        NEATSpeciation.respeciate(pop)
 
     for gen in range(ngen):
         stats.record_gen(gen, pop, print_)
@@ -1274,7 +1010,7 @@ def run(
         if target_fit is not None and g.fitness >= target_fit:
             if print_: print(f"\nTarget fitness {target_fit} reached.")
             break
-        
+
         # create offspring
         if config.mating_strategy == MatingStrategy.NEATSpeciation:
             elites, children = NEATSpeciation.make_offspring(pop, n_offspring)
@@ -1284,18 +1020,18 @@ def run(
         # mutate offspring (not elites!)
         for child in children:
             child.mutate()
-        
+
         offspring = elites + children
         evaluate(offspring)
 
         # select new population
-        if config.selection_strategy == SelectionStrategy.NEAT:
+        if config.mating_strategy == MatingStrategy.NEATSpeciation:
             NEATSpeciation.select(pop, elites, children)
-        elif config.selection_strategy in (SelectionStrategy.NSGA2, SelectionStrategy.SPEA2):
-            pool = pop.members + children
-            # TODO: pool now also contains elites. do we want this?
-            process_multi_obj(pool)
-            NSGA2.select(pop, elites, children)
-    
+        elif config.mating_strategy == MatingStrategy.GlobalTournament:
+            pool = pop.members + elites + children
+            pool.sort(key=lambda g: g.fitness, reverse=True)
+            pop.members = pool[:config.population_size]
+            pop.species = [] # No longer valid
+
     stats.record_final(top_genomes, print_=print_)
     return top_genomes, pop, stats

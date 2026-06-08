@@ -90,13 +90,6 @@ pub trait Specialization: Clone + Send + Sync + 'static {
 // --- Enums ---
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
-pub enum SelectionStrategy {
-    NEAT,
-    NSGA2,
-    SPEA2,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum MatingStrategy {
     NEATSpeciation,
     GlobalTournament,
@@ -119,8 +112,6 @@ pub struct NEATConfig<SpecConfig = ()> {
     pub species_threshold: f64,
     pub target_species: Option<usize>,
     pub mating_strategy: MatingStrategy,
-    pub selection_strategy: SelectionStrategy,
-    pub diversity_objective: bool,
     pub crossover_enabled: bool,
     pub c1: f64,
     pub c2: f64,
@@ -143,8 +134,6 @@ impl Default for NEATConfig<()> {
             species_threshold: 3.0,
             target_species: None,
             mating_strategy: MatingStrategy::NEATSpeciation,
-            selection_strategy: SelectionStrategy::NEAT,
-            diversity_objective: false,
             crossover_enabled: true,
             c1: 1.0,
             c2: 1.0,
@@ -201,7 +190,6 @@ pub struct Genome<S: Specialization> {
     
     // Evaluation state
     pub fitness: f64,
-    pub objectives: Option<Vec<f64>>, // For Multi-Objective
     pub adj_fitness: Option<f64>,
     pub is_elite: bool, 
     
@@ -223,7 +211,6 @@ impl<S: Specialization> Genome<S> {
             specialization,
             population_state,
             fitness: 0.0,
-            objectives: None,
             adj_fitness: None,
             is_elite: false,
             nodes: nodes.map(|m| m.into_iter().collect()).unwrap_or_default(),
@@ -607,12 +594,39 @@ impl<S: Specialization> Population<S> {
     }
     
     fn make_offspring_neat(&mut self, rng: &mut impl Rng) -> (Vec<GenomeRef<S>>, Vec<GenomeRef<S>>, Vec<GenomeRef<S>>) {
+        let mut min_fitness = f64::INFINITY;
+        let mut max_fitness = f64::NEG_INFINITY;
+        
+        let mut num_valid = 0;
+        for g in self.members.iter() {
+            let fit = g.read().unwrap().fitness;
+            if fit > f64::NEG_INFINITY {
+                min_fitness = min_fitness.min(fit);
+                max_fitness = max_fitness.max(fit);
+                num_valid += 1;
+            }
+        }
+        
+        if num_valid == 0 {
+            min_fitness = 0.0;
+            max_fitness = 0.0;
+        }
+            
+        // Calculate dynamic baseline to ensure poorest performers don't immediately die.
+        let range = (max_fitness - min_fitness).max(1e-7); // prevent divide-by-zero
+        let baseline = range * 0.1; // worst individual gets roughly 10% the weight of a top-tier individual's baseline
+        let offset = -min_fitness + baseline;
+
         // Adjust fitness by species size
         for s in &mut self.species {
             let n = s.members.len() as f64;
             for g_ref in &mut s.members {
                 let mut g = g_ref.write().unwrap();
-                g.adj_fitness = Some(g.fitness / n);
+                if g.fitness == f64::NEG_INFINITY {
+                    g.adj_fitness = Some(0.0);
+                } else {
+                    g.adj_fitness = Some((g.fitness + offset) / n);
+                }
             }
             // Sort species members by fitness descending
             s.members.sort_by(|a, b| {
@@ -655,7 +669,7 @@ impl<S: Specialization> Population<S> {
             if num_offspring == 0 { continue; }
             
             // Species Elitism
-            let elite_count = self.config.num_elites_species.min(s.members.len());
+            let elite_count = self.config.num_elites_species.min(s.members.len()).min(num_offspring);
             for i in 0..elite_count {
                 let elite_ref = s.members[i].clone();
                 elite_ref.write().unwrap().is_elite = true;
@@ -738,111 +752,40 @@ impl<S: Specialization> Population<S> {
     }
     
     /// Selects genomes to form the new population
-    pub fn select(&mut self, elites: Vec<GenomeRef<S>>, species_elites: Vec<GenomeRef<S>>, mut children: Vec<GenomeRef<S>>, rng: &mut impl Rng) {
-        // Combine pools
-        children.extend(elites);
-        children.extend(species_elites);
-        let mut pool = children;
-        
-        // Apply strategy selection
-        if self.config.selection_strategy == SelectionStrategy::NSGA2 {
-            // Re-rank combined pool
-            pool.extend(self.members.iter().cloned());
-            // Fitness processing is now explicit in the run loop
-            self.members = NSGA2::select(pool, self.config.population_size, rng);
-        } else if self.config.selection_strategy == SelectionStrategy::SPEA2 {
-            pool.extend(self.members.iter().cloned());
-            // Fitness processing is now explicit in the run loop
-            pool.sort_by(|a, b| {
-                let ga = a.read().unwrap();
-                let gb = b.read().unwrap();
-                gb.fitness.partial_cmp(&ga.fitness).unwrap_or(Ordering::Equal)
-            });
-            pool.truncate(self.config.population_size);
-            self.members = pool;
-        } else {
-            // NEAT standard selection is implicit in reproduction counts, 
-            // but we must ensure we don't exceed pop size
-            pool.truncate(self.config.population_size);
-            self.members = pool;
-            
-            // ReSpeciate only for NEAT selection
-            self.respeciate();
-        }
-    }
-    
-    /// Augments diversity objective for each genome based on k-nearest neighbors.
-    pub fn augment_diversity(&self, genomes: &[GenomeRef<S>]) {
-        if !self.config.diversity_objective { return; }
-        let n = genomes.len();
-        if n < 2 { return; }
-        
-        // Parallel computation of distance matrix (upper triangle only)
-        // Each row can be computed independently
-        let dists: Vec<Vec<f64>> = (0..n).into_par_iter().map(|i| {
-            let gi = genomes[i].read().unwrap();
-            (0..n).map(|j| {
-                if i == j {
-                    0.0
-                } else if i < j {
-                    // Compute distance only for upper triangle
-                    let gj = genomes[j].read().unwrap();
-                    calculate_compatibility(&*gi, &*gj)
-                } else {
-                    // Lower triangle will be filled by symmetry later
-                    0.0
-                }
-            }).collect()
-        }).collect();
-        
-        // Build symmetric matrix (serial, very fast)
-        let mut full_dists = vec![vec![0.0; n]; n];
-        for i in 0..n {
-            for j in 0..n {
-                if i <= j {
-                    full_dists[i][j] = dists[i][j];
-                    full_dists[j][i] = dists[i][j];
-                }
-            }
-        }
-        
-        let k = (n - 1).min(5);
-        
-        // Parallel computation of k-NN diversity scores
-        let diversity_scores: Vec<f64> = full_dists.par_iter().map(|row| {
-            let mut sorted_row = row.clone();
-            sorted_row.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
-            sorted_row.iter().skip(1).take(k).sum::<f64>() / k as f64
-        }).collect();
-        
-        // Serial update of objectives (fast, requires write lock)
-        for (i, &knn_avg) in diversity_scores.iter().enumerate() {
-            let mut g = genomes[i].write().unwrap();
-            if let Some(objs) = &mut g.objectives {
-                objs.push(knn_avg);
-            } else {
-                g.objectives = Some(vec![g.fitness, knn_avg]);
+    pub fn select(&mut self, elites: Vec<GenomeRef<S>>, species_elites: Vec<GenomeRef<S>>, mut children: Vec<GenomeRef<S>>, _rng: &mut impl Rng) {
+        match self.config.mating_strategy {
+            MatingStrategy::NEATSpeciation => {
+                // Combine pools
+                children.extend(elites);
+                children.extend(species_elites);
+                let mut pool = children;
+
+                // NEAT standard selection is implicit in reproduction counts,
+                // but we must ensure we don't exceed pop size
+                pool.truncate(self.config.population_size);
+                self.members = pool;
+
+                // ReSpeciate
+                self.respeciate();
+            },
+            MatingStrategy::GlobalTournament => {
+                let mut pool = self.members.clone();
+                pool.extend(children);
+                pool.extend(elites);
+                pool.extend(species_elites);
+                
+                pool.sort_by(|a, b| {
+                    let ga = a.read().unwrap();
+                    let gb = b.read().unwrap();
+                    gb.fitness.partial_cmp(&ga.fitness).unwrap_or(Ordering::Equal)
+                });
+                
+                self.members = pool.into_iter().take(self.config.population_size).collect();
+                self.species.clear();
             }
         }
     }
     
-    /// Processes multi-objective fitness (Rank/Crowding or Strength/Density)
-    /// Updates g.fitness based on g.objectives.
-    pub fn process_multi_objective(&self, genomes: &mut [GenomeRef<S>]) {
-        // If no objectives, nothing to do (fitness is already set)
-        // Actually, we should check if any genome has objectives.
-        if genomes.is_empty() { return; }
-        
-        // Check if we have objectives
-        let has_objectives = genomes[0].read().unwrap().objectives.is_some();
-        if !has_objectives { return; }
-        
-        if self.config.selection_strategy == SelectionStrategy::NSGA2 {
-            NSGA2::process_fitness(genomes);
-        } else if self.config.selection_strategy == SelectionStrategy::SPEA2 {
-            SPEA2::process_fitness(genomes);
-        }
-    }
 }
 
 // --- Algorithm Core Functions ---
@@ -905,181 +848,3 @@ pub fn crossover<S: Specialization>(g1: &Genome<S>, g2: &Genome<S>, rng: &mut im
     Genome::new(p1.config.clone(), p1.specialization.clone(), p1.population_state.clone(), Some(child_edges), Some(child_nodes))
 }
 
-// --- NSGA2 Strategy ---
-
-struct NSGA2;
-
-impl NSGA2 {
-    fn process_fitness<S: Specialization>(genomes: &mut [GenomeRef<S>]) {
-        let n = genomes.len();
-        let objs: Vec<Vec<f64>> = genomes.iter().map(|g| g.read().unwrap().objectives.clone().unwrap_or_default()).collect();
-        if objs.is_empty() { return; }
-        
-        let fronts = Self::fast_non_dominated_sort(&objs);
-        let crowding = Self::calculate_crowding_distance(&objs, &fronts);
-        let max_rank = fronts.len();
-        
-        // Build rank map (serial, very fast)
-        let mut rank_map = vec![0; n];
-        for (r, front) in fronts.iter().enumerate() {
-            for &i in front { rank_map[i] = r + 1; }
-        }
-        
-        // Parallel fitness assignment
-        genomes.par_iter().enumerate().for_each(|(i, g_ref)| {
-            let rank_score = (max_rank - rank_map[i] + 1) as f64 * (n as f64 + 1.0);
-            let c_dist = if crowding[i].is_infinite() { objs[0].len() as f64 * 2.0 } else { crowding[i] };
-            g_ref.write().unwrap().fitness = rank_score + c_dist;
-        });
-    }
-    
-    fn select<S: Specialization>(mut pool: Vec<GenomeRef<S>>, n: usize, _rng: &mut impl Rng) -> Vec<GenomeRef<S>> {
-        pool.sort_by(|a, b| {
-            let ga = a.read().unwrap();
-            let gb = b.read().unwrap();
-            gb.fitness.partial_cmp(&ga.fitness).unwrap_or(Ordering::Equal)
-        });
-        pool.into_iter().take(n).collect()
-    }
-    
-    fn fast_non_dominated_sort(objectives: &[Vec<f64>]) -> Vec<Vec<usize>> {
-        let n = objectives.len();
-        let mut fronts = Vec::new();
-        
-        // Parallel computation of dominance relationships
-        // For each individual i, compute who it dominates and count who dominates it
-        let dominance_data: Vec<(Vec<usize>, usize)> = (0..n).into_par_iter().map(|i| {
-            let mut dominates = Vec::new();
-            let mut dominated_by_count = 0;
-            
-            for j in 0..n {
-                if i == j { continue; }
-                if Self::dominates(&objectives[i], &objectives[j]) {
-                    dominates.push(j);
-                } else if Self::dominates(&objectives[j], &objectives[i]) {
-                    dominated_by_count += 1;
-                }
-            }
-            
-            (dominates, dominated_by_count)
-        }).collect();
-        
-        // Extract into separate vectors (serial, very fast)
-        let mut domination_counts: Vec<usize> = dominance_data.iter().map(|(_, count)| *count).collect();
-        let dominates_lists: Vec<Vec<usize>> = dominance_data.into_iter().map(|(list, _)| list).collect();
-        
-        // First front: individuals with zero domination count
-        let mut current_front: Vec<usize> = (0..n).filter(|&i| domination_counts[i] == 0).collect();
-        
-        // Sequential front building (inherently sequential algorithm)
-        while !current_front.is_empty() {
-            fronts.push(current_front.clone());
-            let mut next_front = Vec::new();
-            for &i in &current_front {
-                for &j in &dominates_lists[i] {
-                    domination_counts[j] -= 1;
-                    if domination_counts[j] == 0 { next_front.push(j); }
-                }
-            }
-            current_front = next_front;
-        }
-        fronts
-    }
-    
-    fn dominates(o1: &[f64], o2: &[f64]) -> bool {
-        let mut better = false;
-        let mut worse = false;
-        for (v1, v2) in o1.iter().zip(o2.iter()) {
-            if v1 > v2 { better = true; }
-            if v1 < v2 { worse = true; }
-        }
-        better && !worse
-    }
-    
-    fn calculate_crowding_distance(objectives: &[Vec<f64>], fronts: &[Vec<usize>]) -> Vec<f64> {
-        let n = objectives.len();
-        if n == 0 { return vec![]; }
-        let num_obj = objectives[0].len();
-        let mut distances = vec![0.0; n];
-        
-        // Process each front independently (could parallelize over fronts, but typically few fronts)
-        for front in fronts {
-            let l = front.len();
-            if l < 3 {
-                for &idx in front { distances[idx] = f64::INFINITY; }
-                continue;
-            }
-            
-            // Initialize distances for this front
-            for &idx in front { distances[idx] = 0.0; }
-            
-            // For each objective dimension
-            for m in 0..num_obj {
-                let mut sorted_front = front.clone();
-                sorted_front.sort_by(|&a, &b| objectives[a][m].partial_cmp(&objectives[b][m]).unwrap_or(Ordering::Equal));
-                
-                // Boundary individuals get infinite distance
-                distances[sorted_front[0]] = f64::INFINITY;
-                distances[sorted_front[l-1]] = f64::INFINITY;
-                
-                let min_val = objectives[sorted_front[0]][m];
-                let max_val = objectives[sorted_front[l-1]][m];
-                let range = max_val - min_val;
-                if range == 0.0 { continue; }
-                
-                // Update crowding distances for interior individuals
-                for i in 1..(l-1) {
-                    if distances[sorted_front[i]].is_infinite() { continue; }
-                    let dist = (objectives[sorted_front[i+1]][m] - objectives[sorted_front[i-1]][m]) / range;
-                    distances[sorted_front[i]] += dist;
-                }
-            }
-        }
-        distances
-    }
-}
-
-// --- SPEA2 Strategy ---
-
-struct SPEA2;
-
-impl SPEA2 {
-    fn process_fitness<S: Specialization>(genomes: &mut [GenomeRef<S>]) {
-        let n = genomes.len();
-        if n == 0 { return; }
-        let objs: Vec<Vec<f64>> = genomes.iter().map(|g| g.read().unwrap().objectives.clone().unwrap_or_default()).collect();
-        
-        // Parallel computation of strength values
-        // For each individual, count how many others it dominates
-        let strength: Vec<usize> = (0..n).into_par_iter().map(|i| {
-            (0..n).filter(|&j| i != j && NSGA2::dominates(&objs[i], &objs[j])).count()
-        }).collect();
-        
-        // Parallel computation of raw fitness
-        // For each individual, sum the strength of all individuals that dominate it
-        let raw_fitness: Vec<f64> = (0..n).into_par_iter().map(|i| {
-            (0..n).filter(|&j| i != j && NSGA2::dominates(&objs[j], &objs[i]))
-                .map(|j| strength[j] as f64)
-                .sum()
-        }).collect();
-        
-        // Parallel computation of density (k-th nearest neighbor)
-        let k = (n as f64).sqrt() as usize;
-        let density: Vec<f64> = (0..n).into_par_iter().map(|i| {
-            // Compute distances to all other individuals
-            let mut dists: Vec<f64> = (0..n).map(|j| {
-                if i == j { return 0.0; }
-                objs[i].iter().zip(&objs[j]).map(|(a, b)| (a - b).powi(2)).sum::<f64>().sqrt()
-            }).collect();
-            
-            dists.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
-            let sigma = dists.get(k).cloned().unwrap_or(0.0);
-            1.0 / (sigma + 2.0)
-        }).collect();
-        
-        // Parallel fitness assignment
-        genomes.par_iter().enumerate().for_each(|(i, g_ref)| {
-            g_ref.write().unwrap().fitness = 1.0 / (raw_fitness[i] + density[i] + 1.0);
-        });
-    }
-}

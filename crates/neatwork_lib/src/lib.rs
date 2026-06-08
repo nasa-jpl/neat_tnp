@@ -2,7 +2,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use numpy::{PyReadonlyArray2, ToPyArray};
 use ndarray::Array2;
-use neat_rs_core::{
+use neat_core_rs::{
     Genome as CoreGenome, 
     Population as CorePopulation,
     Specialization, 
@@ -17,7 +17,7 @@ use serde::{Serialize, Deserialize};
 use pythonize::{depythonize, pythonize};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
-use std::cmp::min;
+
 
 // ============================================================================
 // 1. DOMAIN TYPES (Unified Rust + Python + Serde)
@@ -31,37 +31,41 @@ mod types {
     impl Default for NodeType { fn default() -> Self { NodeType::Flexible } }
 
     #[derive(Clone, Debug, Default, Copy, Serialize, Deserialize)]
-    pub struct TNPNodeData {
+    pub struct NWNodeData {
         pub pos: (i32, i32),
         #[serde(rename = "type")]
         pub type_: NodeType,
     }
 
     #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-    pub struct TNPEdgeData;
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-    pub enum EvaluationStrategy { SingleObjective, MultiObjectiveBridge }
-    impl Default for EvaluationStrategy { fn default() -> Self { Self::SingleObjective } }
+    pub struct NWEdgeData;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub enum GraphInit { FCN, Grid(u32, u32) }
     impl Default for GraphInit { fn default() -> Self { Self::FCN } }
 
+    /// Strategy for combining multiple objective values into a single fitness.
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    pub enum ScalarizationStrategy {
+        #[serde(rename = "augmented_chebyshev")]
+        AugmentedChebyshev {
+            rho: f64,
+        }
+    }
+
     #[derive(Clone, Debug, Serialize, Deserialize)]
-    pub struct TNPConfig {
+    pub struct NWConfig {
         pub grid_size: (usize, usize),
         pub fixed_nodes: Vec<(i32, i32)>,
         pub move_node_mutation_prob: f64,
         pub move_node_mutation_sigma: f64,
-        pub evaluation_strategy: EvaluationStrategy,
         pub graph_init: GraphInit,
         pub compatibility_sigma: usize,
         pub c3: f64,
     }
 
     #[derive(Clone, Debug)]
-    pub struct TNPSpecialization { pub config: TNPConfig }
+    pub struct NWSpecialization { pub config: NWConfig }
 }
 
 use types::*;
@@ -87,7 +91,7 @@ mod algorithm {
         pub fn is_occupied(
             &self, 
             pos: (i32, i32), 
-            nodes: &HashMap<u64, CoreNode<TNPNodeData>>, 
+            nodes: &HashMap<u64, CoreNode<NWNodeData>>, 
             ignore: Option<u64>
         ) -> bool {
             nodes.values().any(|n| n.data.pos == pos && Some(n.id) != ignore)
@@ -96,7 +100,7 @@ mod algorithm {
         pub fn find_free_pos(
             &self, 
             center: (i32, i32), 
-            nodes: &HashMap<u64, CoreNode<TNPNodeData>>, 
+            nodes: &HashMap<u64, CoreNode<NWNodeData>>, 
             rng: &mut impl Rng
         ) -> Option<(i32, i32)> {
             if !self.is_occupied(center, nodes, None) { return Some(center); }
@@ -114,10 +118,10 @@ mod algorithm {
         }
     }
 
-    impl Specialization for TNPSpecialization {
-        type NodeData = TNPNodeData;
-        type EdgeData = TNPEdgeData;
-        type Config = TNPConfig;
+    impl Specialization for NWSpecialization {
+        type NodeData = NWNodeData;
+        type EdgeData = NWEdgeData;
+        type Config = NWConfig;
 
         fn normalize_edge(&self, n1: u64, n2: u64) -> (u64, u64) { 
             if n1 < n2 { (n1, n2) } else { (n2, n1) } 
@@ -136,7 +140,7 @@ mod algorithm {
             for &pos in &self.config.fixed_nodes {
                 nodes.push(CoreNode::new(
                     state.new_node_id(), 
-                    Some(TNPNodeData { pos, type_: NodeType::Fixed })
+                    Some(NWNodeData { pos, type_: NodeType::Fixed })
                 ));
             }
 
@@ -186,7 +190,7 @@ mod algorithm {
                             let id = state.new_node_id();
                             let node = CoreNode::new(
                                 id, 
-                                Some(TNPNodeData { pos, type_: NodeType::Flexible })
+                                Some(NWNodeData { pos, type_: NodeType::Flexible })
                             );
                             nodes.push(node.clone());
                             node_map.insert(id, node);
@@ -282,7 +286,7 @@ mod algorithm {
             
             let midpoint = ((p1.0 + p2.0) / 2, (p1.1 + p2.1) / 2);
             if let Some(pos) = grid.find_free_pos(midpoint, nodes, rng) {
-                new_node.data = TNPNodeData { pos, type_: NodeType::Flexible };
+                new_node.data = NWNodeData { pos, type_: NodeType::Flexible };
                 true
             } else { 
                 false 
@@ -417,10 +421,78 @@ mod evaluation {
         visited.len() == nodes.len()
     }
 
+    fn ccw(a: (f64, f64), b: (f64, f64), c: (f64, f64)) -> bool {
+        (c.1 - a.1) * (b.0 - a.0) > (b.1 - a.1) * (c.0 - a.0)
+    }
+
+    fn edges_intersect(a: (f64, f64), b: (f64, f64), c: (f64, f64), d: (f64, f64)) -> bool {
+        if a == c || a == d || b == c || b == d {
+            return false;
+        }
+        ccw(a, c, d) != ccw(b, c, d) && ccw(a, b, c) != ccw(a, b, d)
+    }
+
+    pub fn has_intersecting_edges(g: &CoreGenome<NWSpecialization>) -> bool {
+        let mut segments = Vec::new();
+        for e in g.edges.values() {
+            if e.enabled {
+                if let (Some(n1), Some(n2)) = (g.nodes.get(&e.node1), g.nodes.get(&e.node2)) {
+                    let p1 = (n1.data.pos.0 as f64, n1.data.pos.1 as f64);
+                    let p2 = (n2.data.pos.0 as f64, n2.data.pos.1 as f64);
+                    segments.push((p1, p2));
+                }
+            }
+        }
+        let n = segments.len();
+        for i in 0..n {
+            for j in (i + 1)..n {
+                if edges_intersect(segments[i].0, segments[i].1, segments[j].0, segments[j].1) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+
+    /// Note: This is technically a floating-point Digital Differential Analyzer (DDA)
+    /// algorithm, rather than pure integer Bresenham, to ensure perfectly symmetric
+    /// edge-weights and reproduce the original Python implementation's trace properties.
+    #[inline]
+    pub fn bresenham(
+        pos1: (i32, i32), 
+        pos2: (i32, i32), 
+        mut callback: impl FnMut(usize, usize, f64, bool)
+    ) {
+        let (r0, c0) = (pos1.0 as f64, pos1.1 as f64);
+        let (r1, c1) = (pos2.0 as f64, pos2.1 as f64);
+        
+        let dist = ((r0 - r1).powi(2) + (c0 - c1).powi(2)).sqrt();
+        if dist < 1e-5 { return; }
+        
+        let n_steps = (r0 - r1).abs().max((c0 - c1).abs()).ceil() as usize + 1;
+        if n_steps < 2 { return; }
+        
+        // Weight respects euclidean distance
+        let edge_vec = ((r1 - r0).abs(), (c1 - c0).abs());
+        let (a, b) = (edge_vec.0.max(edge_vec.1), edge_vec.0.min(edge_vec.1));
+        let c_div_a = if a > 0.0 { (a.powi(2) + b.powi(2)).sqrt() / a } else { 1.0 };
+        let weight = c_div_a;
+        
+        for i in 0..n_steps {
+            let t = i as f64 / (n_steps as f64 - 1.0);
+            let r = (r0 * (1.0 - t) + r1 * t).round() as usize;
+            let c = (c0 * (1.0 - t) + c1 * t).round() as usize;
+            
+            let is_endpoint = i == 0 || i == n_steps - 1;
+            callback(r, c, weight, is_endpoint);
+        }
+    }
+
     pub fn compute_traces(
         h: usize, 
         w: usize, 
-        g: &CoreGenome<TNPSpecialization>
+        g: &CoreGenome<NWSpecialization>
     ) -> Array2<f64> {
         let mut traces = Array2::<f64>::zeros((h, w));
         let mut endpoints = Array2::<f64>::zeros((h, w));
@@ -437,34 +509,15 @@ mod evaluation {
             let n1 = &g.nodes[&e.node1];
             let n2 = &g.nodes[&e.node2];
             
-            let (r0, c0) = (n1.data.pos.0 as f64, n1.data.pos.1 as f64);
-            let (r1, c1) = (n2.data.pos.0 as f64, n2.data.pos.1 as f64);
-            
-            let dist = ((r0 - r1).powi(2) + (c0 - c1).powi(2)).sqrt();
-            if dist < 1e-5 { continue; }
-            
-            let n_steps = (r0 - r1).abs().max((c0 - c1).abs()).ceil() as usize + 1;
-            if n_steps < 2 { continue; }
-            
-            // Weight respects euclidean distance
-            let edge_vec = ((r1 - r0).abs(), (c1 - c0).abs());
-            let (a, b) = (edge_vec.0.max(edge_vec.1), edge_vec.0.min(edge_vec.1));
-            let c_div_a = if a > 0.0 { (a.powi(2) + b.powi(2)).sqrt() / a } else { 1.0 };
-            let weight = c_div_a;
-            
-            for i in 0..n_steps {
-                let t = i as f64 / (n_steps as f64 - 1.0);
-                let r = (r0 * (1.0 - t) + r1 * t).round() as usize;
-                let c = (c0 * (1.0 - t) + c1 * t).round() as usize;
-                
+            bresenham(n1.data.pos, n2.data.pos, |r, c, weight, is_endpoint| {
                 if r < h && c < w {
-                    if i == 0 || i == n_steps - 1 { 
+                    if is_endpoint { 
                         endpoints[[r, c]] += weight; 
                     } else { 
                         traces[[r, c]] += weight; 
                     }
                 }
-            }
+            });
         }
         
         // 3. Merge endpoints
@@ -496,33 +549,46 @@ mod evaluation {
         out
     }
 
-    pub fn calculate_bridge_share(g: &CoreGenome<TNPSpecialization>) -> f64 {
+    pub fn evaluate_traces_on_costmap(
+        map: &Array2<f64>,
+        traces: &Array2<f64>,
+    ) -> (f64, f64) {
+        debug_assert_eq!(map.dim(), traces.dim(), "map and traces must have same shape");
+
+        let loss: f64 = map.iter().zip(traces.iter()).map(|(m, t)| m * t).sum();
+        // let cost_fit = 1.0 / loss.max(1e-7);
+        let cost_fit = -loss;
+        (loss, cost_fit)
+    }
+
+    pub fn calculate_traffic_balance(g: &CoreGenome<NWSpecialization>) -> f64 {
         let n = g.nodes.len();
         if n < 2 { return 0.0; }
         
         let mut id_map = HashMap::new();
-        let mut coords = Vec::new();
+        let mut is_fixed = Vec::new();
+        let mut total_terminals = 0;
+        
         for (i, (&id, node)) in g.nodes.iter().enumerate() {
             id_map.insert(id, i);
-            coords.push(node.data.pos);
+            let fixed = node.data.type_ == NodeType::Fixed;
+            is_fixed.push(fixed);
+            if fixed { total_terminals += 1; }
         }
         
         let mut adj = vec![Vec::new(); n];
-        let mut total_len = 0.0;
         for e in g.edges.values() {
             if !e.enabled { continue; }
-            let (u, v) = (id_map[&e.node1], id_map[&e.node2]);
+            let u = id_map[&e.node1];
+            let v = id_map[&e.node2];
             adj[u].push(v); 
             adj[v].push(u);
-            let (p1, p2) = (coords[u], coords[v]);
-            total_len += (((p1.0 - p2.0).pow(2) + (p1.1 - p2.1).pow(2)) as f64).sqrt();
         }
-        if total_len < 1e-9 { return 0.0; }
 
         let mut tin = vec![-1; n];
         let mut low = vec![-1; n];
         let mut timer = 0;
-        let mut bridge_len = 0.0;
+        let mut total_severity = 0.0;
         
         fn dfs(
             u: usize, 
@@ -530,55 +596,294 @@ mod evaluation {
             timer: &mut i32, 
             tin: &mut Vec<i32>, 
             low: &mut Vec<i32>, 
-            adj: &Vec<Vec<usize>>, 
-            coords: &Vec<(i32, i32)>, 
-            bridge_len: &mut f64
-        ) {
+            adj: &[Vec<usize>], 
+            is_fixed: &[bool],
+            total_terminals: u32,
+            total_severity: &mut f64
+        ) -> u32 {
             tin[u] = *timer; 
             low[u] = *timer; 
             *timer += 1;
+            
+            let mut subtree_terminals = if is_fixed[u] { 1 } else { 0 };
+            
             for &v in &adj[u] {
                 if v as isize == p { continue; }
+                
                 if tin[v] != -1 {
-                    low[u] = min(low[u], tin[v]);
+                    low[u] = low[u].min(tin[v]);
                 } else {
-                    dfs(v, u as isize, timer, tin, low, adj, coords, bridge_len);
-                    low[u] = min(low[u], low[v]);
+                    let child_terminals = dfs(v, u as isize, timer, tin, low, adj, is_fixed, total_terminals, total_severity);
+                    subtree_terminals += child_terminals;
+                    
+                    low[u] = low[u].min(low[v]);
+                    
                     if low[v] > tin[u] {
-                        let (p1, p2) = (coords[u], coords[v]);
-                        *bridge_len += (((p1.0 - p2.0).pow(2) + (p1.1 - p2.1).pow(2)) as f64).sqrt();
+                        let ta = child_terminals;
+                        let tb = total_terminals - ta;
+                        *total_severity += (ta * tb) as f64;
+                    }
+                }
+            }
+            subtree_terminals
+        }
+        
+        for i in 0..n {
+            if tin[i] == -1 {
+                dfs(i, -1, &mut timer, &mut tin, &mut low, &adj, &is_fixed, total_terminals, &mut total_severity);
+            }
+        }
+        
+        -total_severity
+    }
+
+    pub fn calculate_max_edge_traffic(
+        g: &CoreGenome<NWSpecialization>,
+        map: &Array2<f64>
+    ) -> f64 {
+        let (h, w) = (map.nrows(), map.ncols());
+        let n = g.nodes.len();
+        if n < 2 { return 0.0; }
+        
+        let mut id_map = HashMap::new();
+        let mut terminals = Vec::new();
+        
+        for (i, (&id, node)) in g.nodes.iter().enumerate() {
+            id_map.insert(id, i);
+            if node.data.type_ == NodeType::Fixed {
+                terminals.push(i);
+            }
+        }
+        
+        if terminals.len() < 2 { return 0.0; }
+        
+        let mut adj = vec![Vec::new(); n];
+        let mut edge_marks: HashMap<u64, usize> = HashMap::new();
+        
+        for e in g.edges.values() {
+            if !e.enabled { continue; }
+            let n1 = &g.nodes[&e.node1];
+            let n2 = &g.nodes[&e.node2];
+            
+            let mut cost = 0.0;
+            bresenham(n1.data.pos, n2.data.pos, |r, c, weight, _| {
+                if r < h && c < w {
+                    cost += map[[r, c]] * weight;
+                }
+            });
+            
+            let u = id_map[&e.node1];
+            let v = id_map[&e.node2];
+            adj[u].push((v, e.id, cost));
+            adj[v].push((u, e.id, cost));
+            edge_marks.insert(e.id, 0);
+        }
+
+        #[derive(PartialEq)]
+        struct State { cost: f64, node: usize }
+        impl Eq for State {}
+        impl PartialOrd for State {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                other.cost.partial_cmp(&self.cost) // Reverse for min-heap
+            }
+        }
+        impl Ord for State {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                self.partial_cmp(other).unwrap_or(std::cmp::Ordering::Equal)
+            }
+        }
+
+        for i in 0..terminals.len() {
+            let start = terminals[i];
+            
+            let mut dists = vec![f64::INFINITY; n];
+            let mut preds = vec![None; n];
+            let mut heap = std::collections::BinaryHeap::new();
+            
+            dists[start] = 0.0;
+            heap.push(State { cost: 0.0, node: start });
+            
+            while let Some(State { cost, node }) = heap.pop() {
+                if cost > dists[node] { continue; }
+                
+                for &(next_node, edge_id, edge_cost) in &adj[node] {
+                    let next_cost = cost + edge_cost;
+                    if next_cost < dists[next_node] {
+                        dists[next_node] = next_cost;
+                        preds[next_node] = Some((node, edge_id));
+                        heap.push(State { cost: next_cost, node: next_node });
+                    }
+                }
+            }
+            
+            for j in (i + 1)..terminals.len() {
+                let mut current = terminals[j];
+                while current != start {
+                    if let Some((prev, edge_id)) = preds[current] {
+                        if let Some(marks) = edge_marks.get_mut(&edge_id) {
+                            *marks += 1;
+                        }
+                        current = prev;
+                    } else {
+                        break;
                     }
                 }
             }
         }
         
-        dfs(0, -1, &mut timer, &mut tin, &mut low, &adj, &coords, &mut bridge_len);
-        bridge_len / total_len
+        let max_marks = edge_marks.values().max().copied().unwrap_or(0);
+        -(max_marks as f64)
     }
 
-    pub fn evaluate_genome(g: &mut CoreGenome<TNPSpecialization>, map: &Array2<f64>) {
-        let all_nodes: Vec<u64> = g.nodes.keys().copied().collect();
-        let active_edges: HashMap<u64, (u64, u64)> = g.edges.iter()
-            .filter(|(_, e)| e.enabled)
-            .map(|(&k, e)| (k, (e.node1, e.node2)))
-            .collect();
+    /// Compute a single named objective for a genome that is already
+    /// known to be connected.
+    pub fn compute_objective(
+        name: &str,
+        g: &CoreGenome<NWSpecialization>,
+        map: &Array2<f64>,
+    ) -> f64 {
+        match name {
+            "cost_map" => {
+                // Optimization: Instead of allocating a large HxW trace matrix 
+                // and endpoint matrix for every evaluated genome,
+                // we directly accumulate the cost by evaluating the nodes and edges
+                // on the fly against the cost map. This eliminates allocations.
+                // The canonical, slower option would be to use `compute_traces()`.
+                let h = map.nrows();
+                let w = map.ncols();
+                let mut loss = 0.0;
+                
+                // 1. Node contributions
+                for n in g.nodes.values() {
+                    let (r, c) = (n.data.pos.0 as usize, n.data.pos.1 as usize);
+                    if r < h && c < w { 
+                        loss += map[[r, c]]; 
+                    }
+                }
         
-        if !check_connectivity_dict(&all_nodes, &active_edges) { 
-            g.fitness = 0.0; 
-            if g.config.special.evaluation_strategy == EvaluationStrategy::MultiObjectiveBridge {
-                g.objectives = Some(vec![0.0, 0.0]);
-            }
-            return; 
+                // 2. Edge contributions
+                for e in g.edges.values() {
+                    if !e.enabled { continue; }
+                    let n1 = &g.nodes[&e.node1];
+                    let n2 = &g.nodes[&e.node2];
+                    
+                    bresenham(n1.data.pos, n2.data.pos, |r, c, weight, _is_endpoint| {
+                        if r < h && c < w {
+                            loss += map[[r, c]] * weight;
+                        }
+                    });
+                }
+                
+                // Scale loss by map size as originally done in compute_traces
+                let scale = 1.0 / ((h + w) as f64);
+                // Return negative loss since NEAT maximizes fitness
+                -(loss * scale)
+            },
+            "traffic_balance" => calculate_traffic_balance(g),
+            "max_edge_traffic" => calculate_max_edge_traffic(g, map),
+            _ => unimplemented!("Objective '{}' is not implemented yet", name)
         }
+    }
 
-        let traces = compute_traces(map.nrows(), map.ncols(), g);
-        let loss: f64 = map.iter().zip(traces.iter()).map(|(m, t)| m * t).sum();
-        let cost_fit = 1.0 / loss.max(1e-7);
-        
-        g.fitness = cost_fit;
-        if g.config.special.evaluation_strategy == EvaluationStrategy::MultiObjectiveBridge {
-            let robustness = 1.0 - calculate_bridge_share(g);
-            g.objectives = Some(vec![cost_fit, robustness]);
+    /// Combine a list of objective values into a single scalar fitness.
+    pub fn scalarize(
+        values: &[f64], 
+        strategy: &ScalarizationStrategy,
+        utopia: &[f64],
+        nadir: &[f64]
+    ) -> f64 {
+        match strategy {
+            ScalarizationStrategy::AugmentedChebyshev { rho } => {
+                let mut max_weighted_dist = f64::NEG_INFINITY;
+                let mut sum_weighted_dist = 0.0;
+
+                for i in 0..values.len() {
+                    let range = utopia[i] - nadir[i];
+                    let w = if range > 1e-9 { 1.0 / range } else { 1.0 };
+                    
+                    // Since all objectives are formulated such that higher = better (fitnesses),
+                    // our Euclidean "distance from Utopia" is (utopia - val).
+                    let dist = utopia[i] - values[i];
+                    let weighted_dist = w * dist;
+
+                    max_weighted_dist = max_weighted_dist.max(weighted_dist);
+                    sum_weighted_dist += weighted_dist;
+                }
+
+                // Augmented Chebyshev seeks to minimize this combined distance term.
+                // Since NEAT *maximizes* fitness, we must negate the final result!
+                let scalar_dist = max_weighted_dist + (rho * sum_weighted_dist);
+                -scalar_dist
+            }
+        }
+    }
+
+    pub fn evaluate_genomes_batch(
+        genomes: &mut [CoreGenome<NWSpecialization>],
+        map: &Array2<f64>,
+        objectives: &[String],
+        scalarization: Option<&ScalarizationStrategy>,
+        constraints: &[String],
+    ) {
+        if genomes.is_empty() { return; }
+
+        let evaluate_names: Vec<String> = if objectives.is_empty() {
+            vec!["cost_map".to_string()]
+        } else {
+            objectives.to_vec()
+        };
+
+        let check_intersections = constraints.iter().any(|c| c == "no_intersecting_edges");
+
+        let n_objs = evaluate_names.len();
+
+        // Phase 1: Compute raw objectives in parallel
+        let raw_results: Vec<Option<Vec<f64>>> = genomes.par_iter_mut().map(|g| {
+            // Connectivity is always checked (structural invariant, also enforced at mutation time)
+            let all_nodes: Vec<u64> = g.nodes.keys().copied().collect();
+            let active_edges: HashMap<u64, (u64, u64)> = g.edges.iter()
+                .filter(|(_, e)| e.enabled)
+                .map(|(&k, e)| (k, (e.node1, e.node2)))
+                .collect();
+
+            if !check_connectivity_dict(&all_nodes, &active_edges) {
+                g.fitness = f64::NEG_INFINITY;
+                return None;
+            }
+
+            // Optional constraints
+            if check_intersections && has_intersecting_edges(g) {
+                g.fitness = f64::NEG_INFINITY;
+                return None;
+            }
+
+            Some(evaluate_names.iter().map(|name| compute_objective(name, g, map)).collect())
+        }).collect();
+
+        // Phase 2: Scalarize or bypass
+        if n_objs == 1 {
+            for (g, res) in genomes.iter_mut().zip(raw_results.into_iter()) {
+                if let Some(vals) = res {
+                    g.fitness = vals[0];
+                }
+            }
+        } else {
+            let mut utopia = vec![f64::NEG_INFINITY; n_objs];
+            let mut nadir = vec![f64::INFINITY; n_objs];
+
+            for res in raw_results.iter().flatten() {
+                for (i, &val) in res.iter().enumerate() {
+                    utopia[i] = utopia[i].max(val);
+                    nadir[i] = nadir[i].min(val);
+                }
+            }
+
+            let strat = scalarization.expect("Scalarization strategy is required for multi-objective optimization");
+            for (g, res) in genomes.iter_mut().zip(raw_results.into_iter()) {
+                if let Some(vals) = res {
+                    g.fitness = scalarize(&vals, strat, &utopia, &nadir);
+                }
+            }
         }
     }
 }
@@ -587,36 +892,43 @@ mod evaluation {
 // 4. PYTHON INTERFACE
 // ============================================================================
 
+// Structure of mod python:
+//   dto       — Serde Data Transfer Objects used for Rust <-> Python genome serialization
+//   wrappers  — #[pyclass] wrappers for Node, Edge, Species, Genome, Population
+//   functions — #[pyfunction] entrypoints: batch ops, evolutionary ops, utilities
+
 mod python {
     use super::*;
 
-    // --- Serde DTO for IO (Single unified type) ---
-    // DTO = Data Transfer Object: a plain data-only struct used for serialization/deserialization
-    // and moving data across boundaries (e.g., Rust <-> Python, or Rust <-> JSON), without
-    // embedding business logic.
-    #[derive(Serialize, Deserialize)]
-    struct GenomeDTO {
-        nodes: Vec<NodeDTO>,
-        edges: Vec<EdgeDTO>,
+    // --- DTOs (Serde, genome serialization) ---
+
+    mod dto {
+        use super::*;
+
+        #[derive(Serialize, Deserialize)]
+        pub struct GenomeDTO {
+            pub nodes: Vec<NodeDTO>,
+            pub edges: Vec<EdgeDTO>,
+        }
+
+        #[derive(Serialize, Deserialize)]
+        pub struct NodeDTO {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            pub id: Option<u64>,
+            pub data: NWNodeData,
+        }
+
+        #[derive(Serialize, Deserialize)]
+        pub struct EdgeDTO {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            pub id: Option<u64>,
+            pub node1: u64,
+            pub node2: u64,
+            pub enabled: bool,
+        }
     }
 
-    #[derive(Serialize, Deserialize)]
-    struct NodeDTO {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        id: Option<u64>,
-        data: TNPNodeData,
-    }
-
-    #[derive(Serialize, Deserialize)]
-    struct EdgeDTO {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        id: Option<u64>,
-        node1: u64,
-        node2: u64,
-        enabled: bool,
-    }
-
-    // --- Node/Edge Inspection Wrappers ---
+    // --- Wrappers (Node, Edge, Species, Genome, Population) ---
     #[pyclass(name = "NodeData")]
     #[derive(Clone, Debug)]
     pub struct PyNodeData {
@@ -676,7 +988,7 @@ mod python {
     // --- Species Wrapper ---
     #[pyclass(name = "Species")]
     pub struct PySpecies {
-        pub inner: neat_rs_core::Species<TNPSpecialization>,
+        pub inner: neat_core_rs::Species<NWSpecialization>,
     }
 
     #[pymethods]
@@ -700,7 +1012,7 @@ mod python {
     #[pyclass(name = "Genome")]
     #[derive(Clone)]
     pub struct PyGenome {
-        pub inner: Arc<RwLock<CoreGenome<TNPSpecialization>>>,
+        pub inner: Arc<RwLock<CoreGenome<NWSpecialization>>>,
     }
 
     #[pymethods]
@@ -715,24 +1027,14 @@ mod python {
             self.inner.write().unwrap().fitness = v; 
         }
 
-        #[getter]
-        fn objectives(&self) -> Option<Vec<f64>> {
-            self.inner.read().unwrap().objectives.clone()
-        }
-
-        #[setter]
-        fn set_objectives(&self, v: Option<Vec<f64>>) {
-            self.inner.write().unwrap().objectives = v;
-        }
-
         fn get_structure(&self, py: Python) -> PyResult<PyObject> {
             let g = self.inner.read().unwrap();
-            let dto = GenomeDTO {
-                nodes: g.nodes.values().map(|n| NodeDTO {
+            let dto = dto::GenomeDTO {
+                nodes: g.nodes.values().map(|n| dto::NodeDTO {
                     id: Some(n.id),
                     data: n.data,
                 }).collect(),
-                edges: g.edges.values().map(|e| EdgeDTO {
+                edges: g.edges.values().map(|e| dto::EdgeDTO {
                     id: Some(e.id),
                     node1: e.node1,
                     node2: e.node2,
@@ -771,7 +1073,7 @@ mod python {
     // --- Population Wrapper ---
     #[pyclass(name = "Population")]
     pub struct PyPopulation {
-        pub core: Arc<RwLock<CorePopulation<TNPSpecialization>>>,
+        pub core: Arc<RwLock<CorePopulation<NWSpecialization>>>,
     }
 
     #[pymethods]
@@ -779,8 +1081,8 @@ mod python {
         #[new]
         #[pyo3(signature = (config, start_genome=None))]
         fn new(_py: Python, config: &Bound<PyAny>, start_genome: Option<PyGenome>) -> PyResult<Self> {
-            let rust_config: CoreNEATConfig<TNPConfig> = depythonize(config)?;
-            let spec = TNPSpecialization { config: rust_config.special.clone() };
+            let rust_config: CoreNEATConfig<NWConfig> = depythonize(config)?;
+            let spec = NWSpecialization { config: rust_config.special.clone() };
             let mut pop = CorePopulation::new(rust_config, spec);
             pop.initialize(start_genome.map(|g| g.inner.read().unwrap().clone()).as_ref());
             Ok(Self { core: Arc::new(RwLock::new(pop)) })
@@ -810,25 +1112,22 @@ mod python {
             let pop = self.core.read().unwrap();
             let max = pop.members.iter()
                 .map(|g| g.read().unwrap().fitness)
-                .fold(0.0f64, |a, b| a.max(b));
+                .fold(f64::NEG_INFINITY, |a, b| a.max(b));
             let sum: f64 = pop.members.iter()
                 .map(|g| g.read().unwrap().fitness)
+                .filter(|&f| f > f64::NEG_INFINITY)
                 .sum();
+            let num_valid = pop.members.iter()
+                .filter(|g| g.read().unwrap().fitness > f64::NEG_INFINITY)
+                .count();
+            let avg = if num_valid > 0 { sum / num_valid as f64 } else { 0.0 };
+
             let species_fits: Vec<f64> = pop.species.iter()
                 .map(|s| s.members.iter()
                     .map(|g| g.read().unwrap().fitness)
-                    .fold(0.0f64, |a, b| a.max(b))
+                    .fold(f64::NEG_INFINITY, |a, b| a.max(b))
                 ).collect();
-            let avg = sum / pop.members.len().max(1) as f64;
-            (max, avg, pop.species.len(), species_fits)
-        }
-
-        fn augment_diversity(&self, py: Python, genomes: Vec<PyGenome>) {
-            let core = self.core.clone();
-            let refs: Vec<_> = genomes.into_iter().map(|g| g.inner).collect();
-            py.allow_threads(move || {
-                core.read().unwrap().augment_diversity(&refs);
-            });
+            (if max == f64::NEG_INFINITY { 0.0 } else { max }, avg, pop.species.len(), species_fits)
         }
 
         fn new_node_id(&self) -> u64 {
@@ -874,7 +1173,7 @@ mod python {
         ///         ]
         ///     }
         fn create_genome(&self, _py: Python, structure: &Bound<PyDict>) -> PyResult<PyGenome> {
-            let dto: GenomeDTO = depythonize(structure)?;
+            let dto: dto::GenomeDTO = depythonize(structure)?;
             let pop = self.core.write().unwrap();
             
             let mut nodes = HashMap::new();
@@ -960,15 +1259,32 @@ mod python {
         }
     }
 
-    // --- Batch Functions ---
+    // --- Evolutionary operations (batch eval, mutation, reproduction, selection) ---
+
     #[pyfunction]
-    pub fn evaluate_genomes(py: Python, genomes: Vec<PyGenome>, cost_map: PyReadonlyArray2<f64>) {
+    #[pyo3(signature = (genomes, cost_map, objectives=vec![], scalarization=None, constraints=None))]
+    pub fn evaluate_genomes(
+        py: Python,
+        genomes: Vec<PyGenome>,
+        cost_map: PyReadonlyArray2<f64>,
+        objectives: Vec<String>,
+        scalarization: Option<Bound<'_, PyAny>>,
+        constraints: Option<Vec<String>>,
+    ) {
         let map = cost_map.as_array().to_owned();
-        py.allow_threads(move || {
-            genomes.par_iter().for_each(|g| {
-                evaluation::evaluate_genome(&mut g.inner.write().unwrap(), &map);
-            });
+        let scalar_strat: Option<ScalarizationStrategy> = scalarization
+            .map(|s| depythonize(&s).expect("Failed to deserialize scalarization strategy"));
+        let constraints = constraints.unwrap_or_default();
+
+        let mut cloned_genomes: Vec<_> = genomes.iter().map(|g| g.inner.read().unwrap().clone()).collect();
+        let evaluated_genomes = py.allow_threads(move || {
+            evaluation::evaluate_genomes_batch(&mut cloned_genomes, &map, &objectives, scalar_strat.as_ref(), &constraints);
+            cloned_genomes
         });
+
+        for (py_genome, evaluated_genome) in genomes.iter().zip(evaluated_genomes.into_iter()) {
+            *py_genome.inner.write().unwrap() = evaluated_genome;
+        }
     }
 
     #[pyfunction]
@@ -1025,7 +1341,8 @@ mod python {
         });
     }
 
-    // --- Utility Functions ---
+    // --- Utility functions (inspection, scoring, compatibility) ---
+
     #[pyfunction]
     pub fn get_genome_mask<'py>(
         py: Python<'py>,
@@ -1062,71 +1379,29 @@ mod python {
 
     #[pyfunction]
     pub fn genome_compatibility(g1: &PyGenome, g2: &PyGenome) -> f64 {
-        neat_rs_core::calculate_compatibility(
+        neat_core_rs::calculate_compatibility(
             &*g1.inner.read().unwrap(),
             &*g2.inner.read().unwrap()
         )
     }
 
+    /// Compute a single named objective for a genome.
+    /// Supported names: `"cost_map"`, `"traffic_balance"`, `"max_edge_traffic"`.
     #[pyfunction]
-    pub fn get_pareto_front(genomes: Vec<PyGenome>) -> Vec<PyGenome> {
-        let mut front = Vec::new();
-        // Pre-fetch objectives to avoid locking in the loop
-        let objs: Vec<Option<Vec<f64>>> = genomes.iter()
-            .map(|g| g.inner.read().unwrap().objectives.clone())
-            .collect();
-
-        for (i, g1) in genomes.iter().enumerate() {
-            if let Some(o1) = &objs[i] {
-                let mut dominated = false;
-                for (j, _) in genomes.iter().enumerate() {
-                    if i == j { continue; }
-                    if let Some(o2) = &objs[j] {
-                        // Check if o2 dominates o1 (Maximization)
-                        // A dominates B if A >= B for all and A > B for at least one
-                        let mut strictly_better = false;
-                        let mut equal_or_better = true;
-                        
-                        for k in 0..o1.len() {
-                            if o2[k] < o1[k] {
-                                equal_or_better = false;
-                                break;
-                            }
-                            if o2[k] > o1[k] {
-                                strictly_better = true;
-                            }
-                        }
-                        
-                        if equal_or_better && strictly_better {
-                            dominated = true;
-                            break;
-                        }
-                    }
-                }
-                if !dominated {
-                    front.push(g1.clone());
-                }
-            }
-        }
-        front
-    }
-
-    #[pyfunction]
-    pub fn process_multi_objective(
-        py: Python, 
-        pop: &PyPopulation, 
-        genomes: Vec<PyGenome>
-    ) {
-        let core = pop.core.clone();
-        let mut refs: Vec<_> = genomes.into_iter().map(|g| g.inner).collect();
-        py.allow_threads(move || {
-            core.read().unwrap().process_multi_objective(&mut refs);
-        });
+    pub fn compute_objective(
+        py: Python,
+        genome: &PyGenome,
+        objective: &str,
+        cost_map: PyReadonlyArray2<f64>,
+    ) -> f64 {
+        let map = cost_map.as_array().to_owned();
+        let g = genome.inner.read().unwrap().clone();
+        py.allow_threads(move || evaluation::compute_objective(objective, &g, &map))
     }
 }
 
 #[pymodule]
-fn neat_rs_tnp_rs(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
+fn neatwork_lib(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<python::PyGenome>()?;
     m.add_class::<python::PyPopulation>()?;
     m.add_class::<python::PySpecies>()?;  // Register Species
@@ -1141,7 +1416,6 @@ fn neat_rs_tnp_rs(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(python::get_genome_mask, m)?)?;
     m.add_function(wrap_pyfunction!(python::get_trace_difference, m)?)?;
     m.add_function(wrap_pyfunction!(python::genome_compatibility, m)?)?;
-    m.add_function(wrap_pyfunction!(python::get_pareto_front, m)?)?;
-    m.add_function(wrap_pyfunction!(python::process_multi_objective, m)?)?;
+    m.add_function(wrap_pyfunction!(python::compute_objective, m)?)?;
     Ok(())
 }

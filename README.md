@@ -1,18 +1,18 @@
-# NEAT-TNP: Track Network Planning using NEAT-based Evolution of Graphs
+# NEATWork: Track Network Planning using NEAT-based Evolution of Graphs
 
 This repository contains
 
 * A generalization of the [NEAT genetic algorithm](https://en.wikipedia.org/wiki/Neuroevolution_of_augmenting_topologies) that synthesizes its core mechanism of evolving graphs, without knowledge about neural networks (`neat_core.py`)
 * A re-implementation of the original NEAT use case on top of the generalized algorithm (`neat.py`)
-* A new use case of heuristically finding spatial networks, applied to the track planning of a lunar cargo transport system (`neat_tnp.py`)
-* A high-performance implementation of the TNP use case, written in Rust
+* A new use case of heuristically finding spatial networks, applied to the track planning of a lunar cargo transport system (`neatwork.optimizer_ref`)
+* A high-performance implementation of the track network planning use case, written in Rust
 
 A set of minimal examples can be found in `examples.ipynb`.
 
 ## Installation
 
 ```
-pip install neat_tnp
+pip install neatwork
 ```
 
 Or to build the wheel from sources, run:
@@ -31,19 +31,19 @@ Now you should be able to run the notebooks. Project structure:
 
 ```
 ├── __init__.py
-├── neat_tnp
-│   ├── neat_py_tnp.py          # reference TNP implementation
-│   ├── neat_py_core.py
-│   ├── neat_py_neat.py         # re-implementation of original NEAT
-│   ├── neat_rs_tnp.py          # high-performance TNP implementation
-│   ├── plotting.py             # utilities
-│   ├── config_utils.py
-│   ├── dem_utils.py
-│   └── neat_py_tnp_eval.py     
-├── crates                  # Rust crates for neat_rs_tnp.py
-│   ├── neat_rs_core
-│   └── neat_rs_tnp_rs
-├── examples.ipynb          # canonical examples
-├── pyproject.toml          # dependencies and package definition
-└── README.md               # this file
+├── neatwork
+│   ├── neat_core_py.py
+│   ├── neatwork_py.py          # reference NEATWork implementation
+│   ├── neatwork_rs.py          # high-performance NEATWork implementation
+│   ├── neat.py                 # re-implementation of original NEAT
+│   ├── neatwork_py_eval.py     # internal evaluation helpers
+│   └── utils
+│       ├── dem_utils.py
+│       └── plotting.py
+├── crates                      # Rust crates for neatwork_rs.py
+│   ├── neat_core_rs
+│   └── neatwork_lib
+├── examples.ipynb              # canonical examples
+├── pyproject.toml              # dependencies and package definition
+└── README.md                   # this file
 ```

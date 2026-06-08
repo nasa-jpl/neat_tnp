@@ -1,63 +1,22 @@
-# A specialization of NEAT-core for Track Natwork Planning (TNP)
+# A specialization of NEAT-core for Track Network Planning (NEATWork)
 
-from dataclasses import dataclass, field
-from typing import Dict, List, Tuple, Set, Optional
+from dataclasses import dataclass
+from typing import Callable, Dict, List, Tuple, Optional
 from random import random, choice, gauss, randint
-from enum import IntEnum, auto
-from copy import deepcopy
 from concurrent.futures import ProcessPoolExecutor
 import numpy as np
 
-from neat_tnp.neat_py_core import *
-import neat_tnp.neat_py_tnp_eval as neat_py_tnp_eval
+from neatwork.neat_core_py import *
+import neatwork.neat_core_py as neat_core_py
+import neatwork.neatwork_py_eval as neatwork_py_eval
 
-clip = lambda x, lo, hi: max(lo, min(hi, x))
-flatten = lambda lss: [item for ls in lss for item in ls]
+from neatwork.types import *
 
-class NodeType(IntEnum):
-    Fixed = 0
-    Flexible = 1
-
-class EvaluationStrategy(IntEnum):
-    SingleObjective = 0
-    MultiObjectiveBridge = 1
-
-class GraphInit:
-    FCN = "FCN"
-
-    @staticmethod
-    def grid(rows: int, cols: int):
-        return {"Grid": (rows, cols)}
 
 @dataclass
 class NodeData:
     type_: NodeType
     pos: Tuple[int, int]
-
-@dataclass
-class TNPConfig:
-    """
-    Attributes
-    ----------
-    grid_size
-        The size of the grid where nodes can assume positions in (W,H)
-    fixed_nodes
-        The list of fixed nodes, identified by their 2D positions.
-    move_node_mutation_prob
-        The probability of changing a node's position during mutation.
-    move_node_mutation_sigma
-        The standard deviation of the Gaussian with which node positions are mutated.
-    c3
-        The weight of the avg distance of nodes for genome compatibility calculation.
-    """
-    grid_size: Tuple[int, int] = (10, 10)
-    fixed_nodes: List[Tuple[int, int]] = field(default_factory=list)
-    move_node_mutation_prob: float = 0.6
-    move_node_mutation_sigma: float = 5.0
-    evaluation_strategy: EvaluationStrategy = EvaluationStrategy.SingleObjective
-    graph_init: object = GraphInit.FCN
-    compatibility_sigma: float = 5
-    c3: float = 1.0
 
 class Grid:
     def __init__(self, size: Tuple[int, int]):
@@ -107,9 +66,9 @@ def _get_node_type(node: 'Node') -> NodeType:
         return type_val
     if isinstance(type_val, str):
         return NodeType.Fixed if type_val.lower() == "fixed" else NodeType.Flexible
-    return NodeType(type_val)
+    return NodeType.Fixed if type_val == 0 else NodeType.Flexible
 
-class NEAT_TNP(NEATSpecialization):
+class NEATWork(NEATSpecialization):
 
     def _init_fixed_nodes(self, pop: Population) -> List[Node]:
         return [
@@ -209,42 +168,21 @@ class NEAT_TNP(NEATSpecialization):
         edges = self._init_grid_edges(pop, grid_ids, rows, cols)
         edges.extend(self._connect_fixed_to_nearest(pop, nodes, flex_pos))
         return nodes, edges
-    
-    def add_node(self,
-                 node: Node,
-                 old_edge: Edge,
-                 edge_node1_new: Edge,
-                 edge_new_node2: Edge,
-                 nodes: Dict[NodeID, Node],
-                 edges: Dict[EdgeID, Edge],
-                 ) -> bool:
+
+    def add_node(self, node, old_edge, edge_node1_new, edge_new_node2, nodes, edges) -> bool:
         p1 = _get_node_pos(nodes[old_edge.node1])
         p2 = _get_node_pos(nodes[old_edge.node2])
-
         midpoint = ((p1[0] + p2[0]) // 2, (p1[1] + p2[1]) // 2)
         grid = Grid(self.config.special.grid_size)
         new_pos = grid.find_free_pos(midpoint, nodes)
         if new_pos is None:
             return False
-
-        node.data = NodeData(
-            type_=NodeType.Flexible,
-            pos=new_pos,
-        )
+        node.data = NodeData(type_=NodeType.Flexible, pos=new_pos)
         return True
-    
-    def remove_node(self, 
-                    node: Node, 
-                    edge1: Edge,
-                    edge2: Edge,
-                    new_edge: Edge,
-                    nodes: Dict[NodeID, Node],
-                    edges: Dict[EdgeID, Edge],
-                    ) -> bool:
+
+    def remove_node(self, node, edge1, edge2, new_edge, nodes, edges) -> bool:
         if _get_node_type(node) != NodeType.Flexible:
             return False
-
-        # check if new graph is still connected
         remaining_node_ids = [n_id for n_id in nodes if n_id != node.id]
         remaining_edges_data = {
             eid: (e.node1, e.node2)
@@ -253,15 +191,9 @@ class NEAT_TNP(NEATSpecialization):
         }
         return check_connectivity(remaining_node_ids, remaining_edges_data)
 
-    def remove_node_single(self,
-                           node: Node,
-                           edge: Edge,
-                           nodes: Dict[NodeID, Node],
-                           edges: Dict[EdgeID, Edge],
-                           ) -> bool:
+    def remove_node_single(self, node, edge, nodes, edges) -> bool:
         if _get_node_type(node) != NodeType.Flexible:
             return False
-
         remaining_node_ids = [n_id for n_id in nodes if n_id != node.id]
         remaining_edges_data = {
             eid: (e.node1, e.node2)
@@ -269,20 +201,11 @@ class NEAT_TNP(NEATSpecialization):
             if e.node1 != node.id and e.node2 != node.id and e.enabled
         }
         return check_connectivity(remaining_node_ids, remaining_edges_data)
-    
-    def add_edge(self,
-                 edge: 'Edge',
-                 nodes: Dict[NodeID, Node],
-                 edges: Dict[EdgeID, Edge],
-                 ) -> bool:
+
+    def add_edge(self, edge, nodes, edges) -> bool:
         return True
-    
-    def remove_edge(self,
-                    edge: 'Edge',
-                    nodes: Dict[NodeID, Node],
-                    edges: Dict[EdgeID, Edge],
-                    ) -> bool:
-        # check if new graph is still connected
+
+    def remove_edge(self, edge, nodes, edges) -> bool:
         all_node_ids = list(nodes.keys())
         remaining_edges_data = {
             eid: (e.node1, e.node2)
@@ -290,147 +213,63 @@ class NEAT_TNP(NEATSpecialization):
             if eid != edge.id and e.enabled
         }
         return check_connectivity(all_node_ids, remaining_edges_data)
-    
+
     def move_node_mutation(self, nodes: Dict[NodeID, Node]):
-        """
-        Applies the "move node" mutation with a given probability.
-
-        Randomly selects an existing node and changes its location, based on
-        a Gaussian distribution.
-        """
         conf = self.config.special
-        prob = conf.move_node_mutation_prob
-
-        if random() < prob and nodes:
-            movable_node_ids = [
-                id
-                for id, node in nodes.items()
-                if _get_node_type(node) == NodeType.Flexible
-            ]
-            if not movable_node_ids:
+        if random() < conf.move_node_mutation_prob and nodes:
+            movable = [id for id, n in nodes.items() if _get_node_type(n) == NodeType.Flexible]
+            if not movable:
                 return
-            node_id = choice(movable_node_ids)
+            node_id = choice(movable)
             x1, x2 = _get_node_pos(nodes[node_id])
-            x1 = gauss(x1, sigma=conf.move_node_mutation_sigma)
-            x2 = gauss(x2, sigma=conf.move_node_mutation_sigma)
-            x1, x2 = int(round(x1)), int(round(x2))
+            x1 = int(round(gauss(x1, sigma=conf.move_node_mutation_sigma)))
+            x2 = int(round(gauss(x2, sigma=conf.move_node_mutation_sigma)))
             grid = Grid(conf.grid_size)
             new_pos = grid.clip((x1, x2))
-            if grid.is_occupied(new_pos, nodes, ignore=node_id):
-                return
-            nodes[node_id].data.pos = new_pos
-    
-    # def move_edge_mutation(self,
-    #                        nodes: Dict[NodeID, Node],
-    #                        edges: Dict[EdgeID, Edge],
-    #                        ):
-        
-    #     # Problem: since we penalize through the cost map, the algorithm
-    #     # quickly figures out that a tree is a good approach, but in a
-    #     # tree removing an edge is useless because it will always destroy
-    #     # connectivity, leading to an invalid individual. This is why we
-    #     # implement a separate mutation that moves edges rather than
-    #     # deleting them.
+            if not grid.is_occupied(new_pos, nodes, ignore=node_id):
+                nodes[node_id].data.pos = new_pos
 
-    #     conf = self.config.special
-    #     prob = conf.move_edge_mutation_prob
-
-    #     if random() < prob:
-    #         edge_id = choice(list(edges.keys()))
-    #         node1_id = choice(list(nodes.keys()))
-    #         node2_id = choice(list(nodes.keys()))
-    #         if node1_id == node2_id:
-    #             return
-    #         if check_connectivity(
-    #             nodes=list(nodes.keys()),
-    #             edges={
-    #                 e.id: (e.node1, e.node2)
-    #                 for e in edges.values()
-    #                 if e.id != edge_id
-    #             }|{edge_id: (node1_id,node2_id)}
-    #         ):
-    #             edges[edge_id].node1 = node1_id
-    #             edges[edge_id].node2 = node2_id
-
-    def mutate(self,
-               nodes: Dict[NodeID, Node],
-               edges: Dict[EdgeID, Edge],
-               ):
+    def mutate(self, nodes, edges):
         self.move_node_mutation(nodes)
-        # self.move_edge_mutation(nodes, edges)
-    
-    # for now, we consider undirected graphs
+
     @staticmethod
-    def normalize_edge(node_id1: NodeID, 
-                       node_id2: NodeID) -> Tuple[NodeID, NodeID]:
-        id1 = min(node_id1, node_id2)
-        id2 = max(node_id1, node_id2)
-        return (id1, id2)
+    def normalize_edge(node_id1: NodeID, node_id2: NodeID) -> Tuple[NodeID, NodeID]:
+        return (min(node_id1, node_id2), max(node_id1, node_id2))
 
     def compatibility(self,
-                      genome1: Genome, matching1: List[Edge], disjoint1: List[Edge], excess1: List[Edge],
-                      genome2: Genome, matching2: List[Edge], disjoint2: List[Edge], excess2: List[Edge]):
-
-        # Get grid dimensions from config
+                      genome1, matching1, disjoint1, excess1,
+                      genome2, matching2, disjoint2, excess2):
         conf = self.config.special
         h, w = conf.grid_size
-        factor = conf.c3
-        sigma = conf.compatibility_sigma
-        
-        # Compute traces for both genomes
-        t1 = neat_py_tnp_eval.compute_traces(h,w,genome1)
-        t2 = neat_py_tnp_eval.compute_traces(h,w,genome2)
-        
-        # Apply max pooling
-        s1 = max_pool(t1, sigma)
-        s2 = max_pool(t2, sigma)
-        
-        # Calculate Euclidean distance
-        diff_squared = np.sum((s1 - s2) ** 2)
-        distance = np.sqrt(diff_squared) * factor
-        
-        return distance
+        t1 = neatwork_py_eval.compute_traces(h, w, genome1)
+        t2 = neatwork_py_eval.compute_traces(h, w, genome2)
+        s1 = max_pool(t1, conf.compatibility_sigma)
+        s2 = max_pool(t2, conf.compatibility_sigma)
+        return np.sqrt(np.sum((s1 - s2) ** 2)) * conf.c3
 
 def max_pool(input_array: np.ndarray, block: int) -> np.ndarray:
-    """Max pooling with specified block size."""
     h, w = input_array.shape
     nh, nw = h // block, w // block
-    
     out = np.zeros((nh, nw), dtype=np.float64)
     for r in range(nh):
         for c in range(nw):
-            out[r, c] = input_array[
-                r * block:(r + 1) * block,
-                c * block:(c + 1) * block
-            ].max()
-    
+            out[r, c] = input_array[r*block:(r+1)*block, c*block:(c+1)*block].max()
     return out
 
-def check_connectivity(nodes: List[int], edges: Dict[int, Tuple[int,int]]) -> bool:
+def check_connectivity(nodes: List[int], edges: Dict[int, Tuple[int, int]]) -> bool:
     if not nodes:
         return True
-
     adj = {node_id: [] for node_id in nodes}
-    for (n1,n2) in edges.values():
-        # graph is undirected
+    for (n1, n2) in edges.values():
         adj[n1].append(n2)
         adj[n2].append(n1)
-
     visited = set()
-    stack = []
-    start_node_id = next(iter(nodes))
-    stack.append(start_node_id)
-
+    stack = [next(iter(nodes))]
     while stack:
-        current_node_id = stack.pop()
-
-        if current_node_id not in visited:
-            visited.add(current_node_id)
-
-            for neighbor_id in adj[current_node_id]:
-                if neighbor_id not in visited:
-                    stack.append(neighbor_id)
-
+        cur = stack.pop()
+        if cur not in visited:
+            visited.add(cur)
+            stack.extend(n for n in adj[cur] if n not in visited)
     return len(visited) == len(nodes)
 
 def get_concurrent_executor(num_cores: int = 1):
@@ -441,109 +280,122 @@ def get_concurrent_executor(num_cores: int = 1):
             return map(fn, iterable)
         def __enter__(self): return self
         def __exit__(self, *a): return False
-    
-    use_parallel = num_cores > 1
 
-    executor = ProcessPoolExecutor(max_workers=num_cores) \
-        if use_parallel else SerialExecutor()
-    
-    return executor
+    if num_cores > 1:
+        return ProcessPoolExecutor(max_workers=num_cores)
+    return SerialExecutor()
 
 def concurrent_eval_builder(executor, f_eval_batch: Callable[[List[Genome]], List[float]]):
-    """
-    Transparently parallelizes the evaluation function into `num_cores` processes.
-    """
-
     def f_eval_parallel(genomes: List[Genome]):
-        """Helper to run batched evaluation in parallel."""
-
         if not genomes:
             return []
-
-        # a hack to avoid the population from being pickled
         pop = genomes[0].population
         for g in genomes:
             g.population = None
-        
-        # calculate batches
         m = genomes
         n = executor._max_workers
         k, r = divmod(len(m), n)
-        batches: List[List[Genome]] = []
+        batches = []
         start = 0
         for i in range(n):
             end = start + k + (1 if i < r else 0)
             batches.append(m[start:end])
             start = end
-
-        # calculate fitnesses
         fits = list(executor.map(f_eval_batch, batches))
         fitnesses = [item for f in fits if f is not None for item in f]
-        
-        # restore population references
         for g in genomes:
             g.population = pop
-
         return fitnesses
-
     return f_eval_parallel
 
 def get_genome_mask(genome: Genome, shape: Tuple[int, int]) -> np.ndarray:
-    return neat_py_tnp_eval.compute_traces(shape[0], shape[1], genome)
+    return neatwork_py_eval.compute_traces(shape[0], shape[1], genome)
 
-def get_trace_difference(
-    g1: Genome,
-    g2: Genome,
-    shape: Tuple[int, int],
-    sigma: int,
-) -> np.ndarray:
-    t1 = neat_py_tnp_eval.compute_traces(shape[0], shape[1], g1)
-    t2 = neat_py_tnp_eval.compute_traces(shape[0], shape[1], g2)
-    s1 = max_pool(t1, sigma)
-    s2 = max_pool(t2, sigma)
-    return np.abs(s1 - s2)
+def get_trace_difference(g1: Genome, g2: Genome, shape: Tuple[int, int], sigma: int) -> np.ndarray:
+    t1 = neatwork_py_eval.compute_traces(shape[0], shape[1], g1)
+    t2 = neatwork_py_eval.compute_traces(shape[0], shape[1], g2)
+    return np.abs(max_pool(t1, sigma) - max_pool(t2, sigma))
 
 def genome_compatibility(g1: Genome, g2: Genome) -> float:
     if g1.population is None:
         raise ValueError("Genome has no population reference.")
     return calculate_compatibility(g1.population, g1, g2)
 
-def get_pareto_front(genomes: List[Genome]) -> List[Genome]:
-    front = []
-    objectives = [g.objectives for g in genomes]
-
-    for i, g1 in enumerate(genomes):
-        o1 = objectives[i]
-        if o1 is None:
-            continue
-        dominated = False
-        for j, _ in enumerate(genomes):
-            if i == j:
-                continue
-            o2 = objectives[j]
-            if o2 is None:
-                continue
-            strictly_better = False
-            equal_or_better = True
-            for k in range(len(o1)):
-                if o2[k] < o1[k]:
-                    equal_or_better = False
-                    break
-                if o2[k] > o1[k]:
-                    strictly_better = True
-            if equal_or_better and strictly_better:
-                dominated = True
-                break
-        if not dominated:
-            front.append(g1)
-    return front
-
 def get_best_from_species(pop: Population, n_species: Optional[int] = None) -> List[Genome]:
     get_best = lambda gs: max(gs, key=lambda g: g.fitness)
-    genomes = sorted([
-        get_best(s.members)
-        for s in pop.species
-    ], key=lambda g: g.fitness, reverse=True)
-    if n_species is None:
-        return genomes
-    return genomes[:n_species]
+    genomes = sorted([get_best(s.members) for s in pop.species],
+                     key=lambda g: g.fitness, reverse=True)
+    return genomes if n_species is None else genomes[:n_species]
+
+
+def genome_to_network(genome: Genome) -> Network:
+    nodes = [
+        NetworkNode(id=nid, pos=_get_node_pos(n), type=_get_node_type(n))
+        for nid, n in genome.nodes.items()
+    ]
+    edges = [
+        NetworkEdge(id=e.id, node1=e.node1, node2=e.node2, enabled=e.enabled)
+        for e in genome.edges.values()
+    ]
+    return Network(nodes=nodes, edges=edges, fitness=genome.fitness)
+
+
+def network_to_genome(network: Network, pop: Population) -> Genome:
+    node_dict = {
+        n.id: Node(id=n.id, data=NodeData(type_=n.type, pos=n.pos))
+        for n in network.nodes
+    }
+    edge_dict = {
+        e.id: Edge(id=e.id, node1=e.node1, node2=e.node2, enabled=e.enabled)
+        for e in network.edges
+    }
+    return Genome(
+        config=pop.config,
+        specialization=pop.specialization,
+        population=pop,
+        nodes=node_dict,
+        edges=edge_dict,
+    )
+
+
+@dataclass
+class RunResults:
+    top_networks: List[Network]
+    pop: Population
+    stats: RunStatistics
+    best_from_species: List[Network]
+
+
+def run(
+    config: NEATCoreConfig,
+    eval_config: EvalConfig,
+    print_: bool = True,
+) -> RunResults:
+    from neatwork.neatwork_py_eval import evaluate_batch
+
+    def f_eval(genomes):
+        return evaluate_batch(
+            eval_config.cost_map, genomes,
+            objectives=[o.value for o in eval_config.objectives] or None,
+            scalarization=eval_config.scalarization,
+            constraints=[c.value for c in eval_config.constraints],
+        )
+
+    if config.start_genome is not None:
+        temp_pop = neat_core_py.Population(config, NEATWork)
+        start_genome = network_to_genome(config.start_genome, temp_pop)
+        config = config.model_copy(update={"start_genome": start_genome})
+
+    top_genomes, pop, stats = neat_core_py.run(
+        config=config,
+        f_eval=f_eval,
+        specialization_cls=NEATWork,
+        print_=print_,
+    )
+
+    return RunResults(
+        top_networks=[genome_to_network(g) for g in top_genomes],
+        pop=pop,
+        stats=stats,
+        best_from_species=[genome_to_network(g) for g in get_best_from_species(pop)],
+    )

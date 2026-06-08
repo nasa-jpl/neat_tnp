@@ -124,7 +124,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "neat_rs_core"
+name = "neat_core_rs"
 version = "0.1.0"
 dependencies = [
  "fnv",
@@ -134,12 +134,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "neat_rs_tnp_rs"
-version = "0.1.0"
+name = "neatwork_lib"
+version = "0.2.0"
 dependencies = [
  "fnv",
  "ndarray",
- "neat_rs_core",
+ "neat_core_rs",
  "numpy",
  "pyo3",
  "pythonize",

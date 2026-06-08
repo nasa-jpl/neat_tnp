@@ -1,4 +1,4 @@
-from neat_tnp.neat_py_core import *
+from neatwork.neat_core_py import *
 from typing import Dict, List, Tuple, Optional
 from enum import Enum, auto
 from dataclasses import dataclass
@@ -120,8 +120,13 @@ class NEATOrigSpecialization(NEATSpecialization):
                     nodes: Dict[NodeID, Node],
                     edges: Dict[EdgeID, Edge],
                     ) -> bool:
-        
-        return node.data.type_ not in (NodeType.Input, NodeType.Output)
+        if node.data.type_ in (NodeType.Input, NodeType.Output):
+            return False
+
+        # collapse the two series edges into the rewired edge so it
+        # carries a weight (otherwise new_edge.data stays None)
+        new_edge.data = EdgeData(weight=edge1.data.weight * edge2.data.weight)
+        return True
 
     def remove_node_single(self,
                            node: Node,

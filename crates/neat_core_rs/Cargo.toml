@@ -1,10 +1,10 @@
 [package]
-name = "neat_rs_core"
+name = "neat_core_rs"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "neat_rs_core"
+name = "neat_core_rs"
 crate-type = ["rlib"]  # Pure Rust library only
 
 [dependencies]

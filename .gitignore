@@ -5,6 +5,7 @@ __pycache__/
 
 # Nix files
 *.nix
+npins/
 
 # Build and distribution directories
 target/
